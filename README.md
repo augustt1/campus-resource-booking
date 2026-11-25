@@ -2,7 +2,7 @@
 # Campus Resource Booking System
 
 A lightweight web application for booking and managing shared campus resources
-(study rooms, labs, equipment, halls) built with Python, FastHTML, and SQLite(Can be changed to Supabase later).
+(study rooms, labs, equipment, halls) built with Python, FastHTML, and SQLite.
 
 ## Features
 
@@ -78,15 +78,4 @@ campus-resource-booking/
 ## License
 
 This project is for educational purposes.
-<<<<<<< HEAD
 ```
-=======
-```
-
-A few things to double-check before you commit it:
-- Update the GitHub URL in the clone command with your actual repo link.
-- Confirm your `requirements.txt` only lists what's actually needed (e.g. `python-fasthtml`).
-- If you add a license file, update the License section accordingly.
-
-Want me to also draft a short `docs/design.md` or `docs/reflection.md` to go alongside this, as discussed earlier?
->>>>>>> 1d6b840062479028ae27b79a1515bc4edea74adb
