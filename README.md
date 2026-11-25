@@ -1,5 +1,3 @@
-Here's a README.md tailored to your current project structure (`main.py`, `db.py`, `analytics.py`, `ui.py`, `campus.db`, `requirements.txt`):
-
 ```markdown
 # Campus Resource Booking System
 
