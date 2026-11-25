@@ -3,8 +3,9 @@
 # Database layer: schema, seed data, and all raw queries.
 # No HTML, no routing — just SQLite access.
 # ------------------------------------------------------------
-import sqlite3
+import logging
 import os
+import sqlite3
 from datetime import date, timedelta
 
 DB_PATH = "campus.db"
@@ -33,12 +34,24 @@ SEED_RESOURCES = [
     ("Sports Court 1", "Sports Facility", "Sports Centre", "SC-C1", 20, "Indoor court"),
 ]
 
+logger = logging.getLogger(__name__)
+
 
 def get_db():
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA foreign_keys = ON")
-    return con
+    try:
+        db_dir = os.path.dirname(os.path.abspath(DB_PATH))
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
+        con = sqlite3.connect(DB_PATH, timeout=10.0)
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA foreign_keys = ON")
+        return con
+    except sqlite3.Error as exc:
+        logger.exception("Failed to connect to SQLite database at %s: %s", DB_PATH, exc)
+        raise
+    except OSError as exc:
+        logger.exception("Filesystem error accessing database path %s: %s", DB_PATH, exc)
+        raise
 
 
 SCHEMA = """
@@ -69,174 +82,219 @@ CREATE INDEX IF NOT EXISTS idx_book_res_date ON bookings(resource_id, booking_da
 
 def init_db():
     fresh = not os.path.exists(DB_PATH)
-    con = get_db()
-    con.executescript(SCHEMA)
+    con = None
+    try:
+        con = get_db()
+        con.executescript(SCHEMA)
 
-    if con.execute("SELECT COUNT(*) FROM resources").fetchone()[0] == 0:
-        con.executemany(
-            """INSERT INTO resources
-               (resource_name, resource_type, building, room_code, capacity, notes)
-               VALUES (?,?,?,?,?,?)""",
-            SEED_RESOURCES,
-        )
+        if con.execute("SELECT COUNT(*) FROM resources").fetchone()[0] == 0:
+            con.executemany(
+                """INSERT INTO resources
+                   (resource_name, resource_type, building, room_code, capacity, notes)
+                   VALUES (?,?,?,?,?,?)""",
+                SEED_RESOURCES,
+            )
 
-    if con.execute("SELECT COUNT(*) FROM bookings").fetchone()[0] == 0:
-        today = date.today()
-        demo = [
-            (1, "a.chen", today + timedelta(days=1), "09:00", "11:00", "Group study", "confirmed"),
-            (4, "a.chen", today + timedelta(days=2), "13:00", "16:00", "ML training", "confirmed"),
-            (6, "j.okafor", today + timedelta(days=3), "10:00", "12:00", "Robot build", "confirmed"),
-            (8, "m.rossi", today + timedelta(days=4), "14:00", "17:00", "Filming", "confirmed"),
-            (2, "s.patel", today - timedelta(days=2), "09:00", "10:00", "Revision", "completed"),
-            (5, "s.patel", today - timedelta(days=5), "11:00", "13:00", "Project demo", "completed"),
-            (1, "l.nguyen", today - timedelta(days=7), "15:00", "16:00", "Quiet study", "completed"),
-            (10, "t.brown", today - timedelta(days=9), "18:00", "20:00", "Team practice", "no_show"),
-            (4, "a.chen", today - timedelta(days=12), "09:00", "12:00", "Workshop", "completed"),
-            (7, "j.okafor", today - timedelta(days=15), "13:00", "15:00", "Seminar", "cancelled"),
-            (6, "m.rossi", today - timedelta(days=20), "09:00", "11:00", "Lab session", "completed"),
-            (3, "l.nguyen", today - timedelta(days=24), "10:00", "11:00", "Focus work", "completed"),
-        ]
-        con.executemany(
-            """INSERT INTO bookings
-               (resource_id,user_name,booking_date,start_time,end_time,purpose,status)
-               VALUES (?,?,?,?,?,?,?)""",
-            [(r, u, d.isoformat(), s, e, p, st) for r, u, d, s, e, p, st in demo],
-        )
-    con.commit()
-    con.close()
-    if fresh:
-        print(f"Created fresh database at {DB_PATH}")
+        if con.execute("SELECT COUNT(*) FROM bookings").fetchone()[0] == 0:
+            today = date.today()
+            demo = [
+                (1, "a.chen", today + timedelta(days=1), "09:00", "11:00", "Group study", "confirmed"),
+                (4, "a.chen", today + timedelta(days=2), "13:00", "16:00", "ML training", "confirmed"),
+                (6, "j.okafor", today + timedelta(days=3), "10:00", "12:00", "Robot build", "confirmed"),
+                (8, "m.rossi", today + timedelta(days=4), "14:00", "17:00", "Filming", "confirmed"),
+                (2, "s.patel", today - timedelta(days=2), "09:00", "10:00", "Revision", "completed"),
+                (5, "s.patel", today - timedelta(days=5), "11:00", "13:00", "Project demo", "completed"),
+                (1, "l.nguyen", today - timedelta(days=7), "15:00", "16:00", "Quiet study", "completed"),
+                (10, "t.brown", today - timedelta(days=9), "18:00", "20:00", "Team practice", "no_show"),
+                (4, "a.chen", today - timedelta(days=12), "09:00", "12:00", "Workshop", "completed"),
+                (7, "j.okafor", today - timedelta(days=15), "13:00", "15:00", "Seminar", "cancelled"),
+                (6, "m.rossi", today - timedelta(days=20), "09:00", "11:00", "Lab session", "completed"),
+                (3, "l.nguyen", today - timedelta(days=24), "10:00", "11:00", "Focus work", "completed"),
+            ]
+            con.executemany(
+                """INSERT INTO bookings
+                   (resource_id,user_name,booking_date,start_time,end_time,purpose,status)
+                   VALUES (?,?,?,?,?,?,?)""",
+                [(r, u, d.isoformat(), s, e, p, st) for r, u, d, s, e, p, st in demo],
+            )
+        con.commit()
+        if fresh:
+            print(f"Created fresh database at {DB_PATH}")
+    except sqlite3.Error as exc:
+        if con:
+            try:
+                con.rollback()
+            except sqlite3.Error:
+                pass
+        logger.exception("Failed to initialise database schema/seed data: %s", exc)
+        raise
+    finally:
+        if con:
+            con.close()
 
 
 # ---------------- resources ----------------
 def list_resources(active_only=False, rtype=""):
     con = get_db()
-    q = "SELECT * FROM resources WHERE 1=1"
-    p = []
-    if active_only:
-        q += " AND is_active = 1"
-    if rtype:
-        q += " AND resource_type = ?"
-        p.append(rtype)
-    q += " ORDER BY resource_name"
-    rows = con.execute(q, p).fetchall()
-    con.close()
-    return rows
+    try:
+        q = "SELECT * FROM resources WHERE 1=1"
+        p = []
+        if active_only:
+            q += " AND is_active = 1"
+        if rtype:
+            q += " AND resource_type = ?"
+            p.append(rtype)
+        q += " ORDER BY resource_name"
+        return con.execute(q, p).fetchall()
+    finally:
+        con.close()
 
 
 def get_resource(rid):
     con = get_db()
-    row = con.execute("SELECT * FROM resources WHERE resource_id=?", (rid,)).fetchone()
-    con.close()
-    return row
+    try:
+        return con.execute("SELECT * FROM resources WHERE resource_id=?", (rid,)).fetchone()
+    finally:
+        con.close()
 
 
 def create_resource(resource_name, resource_type, building, room_code, capacity, notes, is_active=1):
     con = get_db()
-    con.execute(
-        """INSERT INTO resources
-           (resource_name, resource_type, building, room_code, capacity, notes, is_active)
-           VALUES (?,?,?,?,?,?,?)""",
-        (resource_name, resource_type, building, room_code, capacity, notes, is_active),
-    )
-    con.commit()
-    con.close()
+    try:
+        con.execute(
+            """INSERT INTO resources
+               (resource_name, resource_type, building, room_code, capacity, notes, is_active)
+               VALUES (?,?,?,?,?,?,?)""",
+            (resource_name, resource_type, building, room_code, capacity, notes, is_active),
+        )
+        con.commit()
+    except sqlite3.Error:
+        con.rollback()
+        raise
+    finally:
+        con.close()
 
 
 def update_resource(rid, resource_name, resource_type, building, room_code, capacity, notes, is_active=1):
     con = get_db()
-    con.execute(
-        """UPDATE resources SET resource_name=?, resource_type=?, building=?,
-           room_code=?, capacity=?, notes=?, is_active=? WHERE resource_id=?""",
-        (resource_name, resource_type, building, room_code, capacity, notes, is_active, rid),
-    )
-    con.commit()
-    con.close()
+    try:
+        con.execute(
+            """UPDATE resources SET resource_name=?, resource_type=?, building=?,
+               room_code=?, capacity=?, notes=?, is_active=? WHERE resource_id=?""",
+            (resource_name, resource_type, building, room_code, capacity, notes, is_active, rid),
+        )
+        con.commit()
+    except sqlite3.Error:
+        con.rollback()
+        raise
+    finally:
+        con.close()
 
 
 def delete_resource(rid):
     con = get_db()
-    con.execute("DELETE FROM resources WHERE resource_id=?", (rid,))
-    con.commit()
-    con.close()
+    try:
+        con.execute("DELETE FROM resources WHERE resource_id=?", (rid,))
+        con.commit()
+    except sqlite3.Error:
+        con.rollback()
+        raise
+    finally:
+        con.close()
 
 
 # ---------------- bookings ----------------
 def list_bookings(upcoming=None, user="", limit=None):
-    q = """SELECT b.*, r.resource_name, r.building, r.room_code, r.resource_type
-           FROM bookings b JOIN resources r USING (resource_id) WHERE 1=1"""
-    p = []
-    if upcoming is True:
-        q += " AND b.booking_date >= ? AND b.status='confirmed'"
-        p.append(date.today().isoformat())
-    elif upcoming is False:
-        q += " AND NOT (b.booking_date >= ? AND b.status='confirmed')"
-        p.append(date.today().isoformat())
-    if user:
-        q += " AND b.user_name = ?"
-        p.append(user)
-    q += " ORDER BY b.booking_date " + ("ASC" if upcoming else "DESC") + ", b.start_time ASC"
-    if limit:
-        q += " LIMIT ?"
-        p.append(limit)
     con = get_db()
-    rows = con.execute(q, p).fetchall()
-    con.close()
-    return rows
+    try:
+        q = """SELECT b.*, r.resource_name, r.building, r.room_code, r.resource_type
+               FROM bookings b JOIN resources r USING (resource_id) WHERE 1=1"""
+        p = []
+        if upcoming is True:
+            q += " AND b.booking_date >= ? AND b.status='confirmed'"
+            p.append(date.today().isoformat())
+        elif upcoming is False:
+            q += " AND NOT (b.booking_date >= ? AND b.status='confirmed')"
+            p.append(date.today().isoformat())
+        if user:
+            q += " AND b.user_name = ?"
+            p.append(user)
+        q += " ORDER BY b.booking_date " + ("ASC" if upcoming else "DESC") + ", b.start_time ASC"
+        if limit is not None:
+            q += " LIMIT ?"
+            p.append(limit)
+        return con.execute(q, p).fetchall()
+    finally:
+        con.close()
 
 
 def get_booking(bid):
     con = get_db()
-    row = con.execute(
-        """SELECT b.*, r.resource_name, r.building, r.room_code
-           FROM bookings b JOIN resources r USING (resource_id)
-           WHERE b.booking_id=?""",
-        (bid,),
-    ).fetchone()
-    con.close()
-    return row
+    try:
+        return con.execute(
+            """SELECT b.*, r.resource_name, r.building, r.room_code
+               FROM bookings b JOIN resources r USING (resource_id)
+               WHERE b.booking_id=?""",
+            (bid,),
+        ).fetchone()
+    finally:
+        con.close()
 
 
 def has_clash(resource_id, booking_date, start_time, end_time, exclude_id=None):
-    q = """SELECT COUNT(*) FROM bookings
-           WHERE resource_id=? AND booking_date=? AND status='confirmed'
-           AND NOT (end_time <= ? OR start_time >= ?)"""
-    p = [resource_id, booking_date, start_time, end_time]
-    if exclude_id:
-        q += " AND booking_id != ?"
-        p.append(exclude_id)
     con = get_db()
-    n = con.execute(q, p).fetchone()[0]
-    con.close()
-    return n > 0
+    try:
+        q = """SELECT COUNT(*) FROM bookings
+               WHERE resource_id=? AND booking_date=? AND status='confirmed'
+               AND NOT (end_time <= ? OR start_time >= ?)"""
+        p = [resource_id, booking_date, start_time, end_time]
+        if exclude_id is not None:
+            q += " AND booking_id != ?"
+            p.append(exclude_id)
+        return con.execute(q, p).fetchone()[0] > 0
+    finally:
+        con.close()
 
 
 def create_booking(resource_id, user_name, booking_date, start_time, end_time, purpose):
     con = get_db()
-    con.execute(
-        """INSERT INTO bookings
-           (resource_id,user_name,booking_date,start_time,end_time,purpose,status)
-           VALUES (?,?,?,?,?,?, 'confirmed')""",
-        (resource_id, user_name, booking_date, start_time, end_time, purpose),
-    )
-    con.commit()
-    con.close()
+    try:
+        con.execute(
+            """INSERT INTO bookings
+               (resource_id,user_name,booking_date,start_time,end_time,purpose,status)
+               VALUES (?,?,?,?,?,?, 'confirmed')""",
+            (resource_id, user_name, booking_date, start_time, end_time, purpose),
+        )
+        con.commit()
+    except sqlite3.Error:
+        con.rollback()
+        raise
+    finally:
+        con.close()
 
 
 def set_booking_status(bid, status):
+    if status not in STATUSES:
+        raise ValueError(f"Invalid booking status: {status!r}")
     con = get_db()
-    con.execute("UPDATE bookings SET status=? WHERE booking_id=?", (status, bid))
-    con.commit()
-    con.close()
+    try:
+        con.execute("UPDATE bookings SET status=? WHERE booking_id=?", (status, bid))
+        con.commit()
+    except sqlite3.Error:
+        con.rollback()
+        raise
+    finally:
+        con.close()
 
 
 def slots_for(resource_id, d):
     con = get_db()
-    rows = con.execute(
-        """SELECT start_time, end_time, user_name FROM bookings
-           WHERE resource_id=? AND booking_date=? AND status='confirmed'
-           ORDER BY start_time""",
-        (resource_id, d),
-    ).fetchall()
-    con.close()
-    return rows
+    try:
+        return con.execute(
+            """SELECT start_time, end_time, user_name FROM bookings
+               WHERE resource_id=? AND booking_date=? AND status='confirmed'
+               ORDER BY start_time""",
+            (resource_id, d),
+        ).fetchall()
+    finally:
+        con.close()

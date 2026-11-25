@@ -1,0 +1,114 @@
+## 1. High-Level App Overview (with subgraphs)
+
+```mermaid
+flowchart TD
+    Start([User visits site]) --> RoleCheck{Role in session?}
+    RoleCheck -->|No role set| DefaultStudent[Default: student]
+    RoleCheck -->|Role set| UseRole[Use session role]
+    DefaultStudent --> Nav
+    UseRole --> Nav
+
+    Nav[Navigation Bar] --> Home[Dashboard /]
+    Nav --> Resources[Resources /resources]
+    Nav --> Bookings[Bookings /bookings]
+    Nav --> Availability[Availability /availability]
+    Nav --> Reports{Staff only? /reports}
+
+    Reports -->|role = staff| ReportsPage[Show KPIs + charts]
+    Reports -->|role = student| Redirect[Redirect to / with error]
+
+    subgraph Resources Page
+        Resources --> ResList[List all resources]
+        ResList --> ResStaffCheck{role = staff?}
+        ResStaffCheck -->|Yes| ResActions[Show Add/Edit/Delete buttons]
+        ResStaffCheck -->|No| ResViewOnly[View only]
+    end
+
+    subgraph Bookings Page
+        Bookings --> BookList[List upcoming + history]
+        BookList --> BookStaffCheck{role = staff?}
+        BookStaffCheck -->|Yes| BookActions[Show Cancel/Complete buttons]
+        BookStaffCheck -->|No| BookViewOnly[View only]
+    end
+```
+
+---
+
+## 2. Booking Creation Logic (`POST /bookings/new`)
+
+This is your most important business logic — worth showing in detail:
+
+```mermaid
+flowchart TD
+    A[User submits booking form] --> B{user_name empty?}
+    B -->|Yes| ErrA[Error: Your name is required]
+    B -->|No| C{end_time <= start_time?}
+    C -->|Yes| ErrB[Error: End time must be after start time]
+    C -->|No| D{Within opening hours 08:00-20:00?}
+    D -->|No| ErrC[Error: Booking must be within opening hours]
+    D -->|Yes| E{booking_date is in the past?}
+    E -->|Yes| ErrD[Error: Cannot book a past date]
+    E -->|No| F{has_clash: resource already booked?}
+    F -->|Yes| ErrE[Error: Resource already booked for that slot]
+    F -->|No| G[create_booking in database]
+    G --> H[Redirect to /bookings with success message]
+
+    ErrA --> I[Redirect to /bookings/new with error]
+    ErrB --> I
+    ErrC --> I
+    ErrD --> I
+    ErrE --> I
+```
+
+---
+
+## 3. Booking Status Change & History Visibility (the bug we fixed)
+
+This diagram documents the logic fix we made — great evidence for your reflection document:
+
+```mermaid
+flowchart TD
+    A[Staff clicks Cancel or Complete] --> B{role = staff?}
+    B -->|No| C[Redirect: Staff only error]
+    B -->|Yes| D[set_booking_status: update status in DB]
+    D --> E{Where does booking appear now?}
+
+    E --> F{upcoming query:\nbooking_date >= today\nAND status = confirmed}
+    E --> G{history query:\nNOT upcoming AND confirmed}
+
+    F -->|Status changed to\ncancelled/completed| F_No[Does NOT match\ndisappears from Upcoming]
+    G -->|Status changed to\ncancelled/completed| G_Yes[Matches NOT confirmed\nappears in History]
+
+    F_No --> Result[Correct behaviour:\nbooking moves from\nUpcoming to History]
+    G_Yes --> Result
+```
+
+---
+
+## 4. Resource CRUD Flow
+
+```mermaid
+flowchart TD
+    A[Staff visits /resources] --> B[List all resources]
+    B --> C{Action?}
+    C -->|Add New| D[GET /resources/new - show form]
+    D --> E[POST /resources/new - create_resource]
+    E --> F[Redirect to /resources]
+
+    C -->|Edit| G[GET /resources/id/edit - prefill form]
+    G --> H[POST /resources/id/edit - update_resource]
+    H --> F
+
+    C -->|Delete| I[POST /resources/id/delete]
+    I --> J[delete_resource - CASCADE deletes related bookings]
+    J --> F
+```
+
+---
+
+## How to use these in your presentation/docs
+
+- Paste each block into any Mermaid-compatible renderer (GitHub markdown, Mermaid Live Editor, Notion, VS Code with Mermaid extension) to generate the visual.
+- Put diagram #1 (overview) early in your slides as "Application Structure."
+- Put diagram #2 and #3 in your "Key Logic / Testing" or "Design Decisions" section — #3 especially pairs well with the bug-fix story in your `docs/reflection.md`, since it shows you *diagnosed and solved* a real issue [2].
+- You can embed these directly in `docs/design.md` as fenced ```mermaid code blocks — GitHub renders them automatically in the repo.
