@@ -135,7 +135,7 @@ def create_resource(resource_name, resource_type, building, room_code, capacity,
     con = get_db()
     con.execute(
         """INSERT INTO resources
-           (resource_name,resource_type,building,room_code,capacity,notes,is_active)
+           (resource_name, resource_type, building, room_code, capacity, notes, is_active)
            VALUES (?,?,?,?,?,?,?)""",
         (resource_name, resource_type, building, room_code, capacity, notes, is_active),
     )
@@ -170,7 +170,7 @@ def list_bookings(upcoming=None, user="", limit=None):
         q += " AND b.booking_date >= ? AND b.status='confirmed'"
         p.append(date.today().isoformat())
     elif upcoming is False:
-        q += " AND b.booking_date < ?"
+        q += " AND NOT (b.booking_date >= ? AND b.status='confirmed')"
         p.append(date.today().isoformat())
     if user:
         q += " AND b.user_name = ?"

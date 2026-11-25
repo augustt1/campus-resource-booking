@@ -1,17 +1,18 @@
 # ui.py
 # ------------------------------------------------------------
-# Presentation layer: shared CSS and reusable FastHTML
-# components. No database access, no routing.
+# Presentation layer: CSS and reusable FastHTML UI components.
+# No database access, no routing logic.
 # ------------------------------------------------------------
 from fasthtml.common import *
 from db import TYPE_ICON
 
+# third item = who can see the nav link: "all" or "staff"
 NAV = [
-    ("/", "Dashboard"),
-    ("/resources", "Resources"),
-    ("/bookings", "Bookings"),
-    ("/availability", "Availability"),
-    ("/reports", "Reports"),
+    ("/", "Dashboard", "all"),
+    ("/resources", "Resources", "all"),
+    ("/bookings", "Bookings", "all"),
+    ("/availability", "Availability", "all"),
+    ("/reports", "Reports", "staff"),
 ]
 
 CSS = """
@@ -112,11 +113,30 @@ background:linear-gradient(180deg,var(--primary) 0%,rgba(196,30,46,.5) 100%);}
 padding:3px 9px;font-size:12px;margin:2px 4px 2px 0;font-weight:600;}
 .slot.free{background:#e7f5ec;color:var(--ok);}
 .filters{display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;}
+.role-switch{display:flex;align-items:center;gap:4px;margin-left:auto;}
 @media(max-width:768px){.chart-bar{gap:8px}.bar-label{font-size:10px}.page-header h1{font-size:24px}}
 """
 
+# ---------------- Role helper ----------------
+def is_staff(session):
+    """Return True if the current session role is staff. No real login is used —
+    this is a lightweight demo role-switcher (see docs/design.md)."""
+    return session.get("role") == "staff"
 
-# ---------------- basic components ----------------
+
+def RoleSwitcher(role, current_path="/"):
+    def link(r, label):
+        active = "nav-link active" if role == r else "nav-link"
+        return A(label, href=f"/role/{r}?next={current_path}", cls=active)
+    return Div(
+        Span("View as:", cls="muted", style="margin-right:6px;font-size:13px;"),
+        link("student", "Student"),
+        link("staff", "Staff"),
+        cls="role-switch",
+    )
+
+
+# ---------------- Basic components ----------------
 def Alert(message, kind="info"):
     if not message:
         return None
@@ -127,10 +147,10 @@ def Empty(title, message="", icon="🗂️"):
     return Div(Span(icon, cls="icon"), H4(title), P(message, cls="muted"), cls="empty")
 
 
-def Card(title, *body, hint="", flush=False):
+def Card(title, *content, hint=None, flush=False):
     return Div(
         Div(H3(title), Span(hint, cls="card-hint") if hint else None, cls="card-head"),
-        Div(*body, cls="card-body flush" if flush else "card-body"),
+        Div(*content, cls="card-body flush" if flush else "card-body"),
         cls="card",
     )
 
@@ -138,9 +158,9 @@ def Card(title, *body, hint="", flush=False):
 def StatItem(icon, value, unit="", label="", note="", tone=""):
     return Div(
         Span(icon, cls="icon"),
-        Div(f"{value}{unit}", cls="number"),
-        Div(label, cls="label"),
-        Div(note, cls="note") if note else None,
+        P(f"{value}{unit}", cls="number"),
+        P(label, cls="label"),
+        P(note, cls="note") if note else None,
         cls=f"stat {tone}".strip(),
     )
 
@@ -157,65 +177,63 @@ def Cell(main, sub=""):
     return Td(Div(main, cls="cell-main"), Div(sub, cls="cell-sub") if sub else None)
 
 
-def DataTable(headers, rows, empty_msg="No records yet."):
+def DataTable(headers, rows, empty_msg="No data to show yet."):
     if not rows:
         return Empty("Nothing here yet", empty_msg)
     return Div(Table(Thead(Tr(*[Th(h) for h in headers])), Tbody(*rows)), cls="table-wrap")
 
 
-def Field(name, label=None, type="text", value="", help_text="", **kw):
+def Field(name, value="", help_text="", type="text"):
     return Div(
-        Label(label or name.replace("_", " ").title(), _for=name),
-        Input(type=type, name=name, id=name, value=value, **kw),
+        Label(name.replace("_", " ").title(), _for=name),
+        Input(name=name, id=name, value=str(value), type=type),
         Div(help_text, cls="help") if help_text else None,
         cls="field",
     )
 
 
-def SelectField(name, options, label=None, value="", blank=""):
+def SelectField(name, options, value="", blank=""):
     opts = []
     if blank:
-        opts.append(Option(blank, value=""))
+        opts.append(Option(blank, value="", selected=(value == "")))
     for o in options:
-        txt, val = (o, o) if not isinstance(o, (list, tuple)) else (o[1], o[0])
-        opts.append(Option(txt, value=val, selected=(str(val) == str(value))))
+        val, txt = (o, o) if not isinstance(o, (list, tuple)) else (o[0], o[1])
+        opts.append(Option(txt, value=str(val), selected=(str(value) == str(val))))
     return Div(
-        Label(label or name.replace("_", " ").title(), _for=name),
+        Label(name.replace("_", " ").title(), _for=name),
         Select(*opts, name=name, id=name),
         cls="field",
     )
 
 
-def TextArea_(name, label=None, value="", full=True):
+def TextArea_(name, value="", full=True):
     return Div(
-        Label(label or name.replace("_", " ").title(), _for=name),
+        Label(name.replace("_", " ").title(), _for=name),
         Textarea(value, name=name, id=name, rows=3),
         cls="field full" if full else "field",
     )
 
 
-def ListingCard(icon, title, meta, body, price, actions=None):
+def ListingCard(icon, title, meta, body, price="", action=None):
     return Div(
         Span(icon, cls="icon"), H4(title), Div(meta, cls="meta"),
-        Div(body, cls="body"), Div(price, cls="price"),
-        Div(*(actions or []), cls="actions") if actions else None,
+        P(body, cls="body"),
+        Div(price, cls="price") if price else None,
+        action,
         cls="listing",
     )
 
 
-# ---------------- charts (pure CSS/SVG, no JS, no CDN) ----------------
+# ---------------- Charts (dependency-free: CSS/SVG, no JS, no CDN) ----------------
 def _pairs(data, label_key="label", value_key="value"):
-    rows = []
     if not data:
-        return rows
-    items = list(data.items()) if isinstance(data, dict) else data
-    for row in items:
+        return []
+    rows = []
+    for row in data:
         if isinstance(row, dict):
             label, value = row.get(label_key, ""), row.get(value_key, 0)
-        elif isinstance(row, (list, tuple)) and len(row) >= 2:
-            label, value = row[0], row[1]
         else:
-            label, value = str(len(rows) + 1), row
+            label, value = row[0], row[1]
         try:
             value = float(value)
         except (TypeError, ValueError):
@@ -229,7 +247,7 @@ def BarChart(data, unit="", label_key="label", value_key="value"):
     if not rows:
         return Div("No data for this period.", cls="chart-empty")
     peak = max((v for _, v in rows), default=0) or 1.0
-    cols = [
+    bars = [
         Div(
             Div(Span(f"{v:g}{unit}", cls="bar-value"), cls="bar-fill",
                 style=f"height:{max((v / peak) * 100, 2):.1f}%"),
@@ -238,7 +256,7 @@ def BarChart(data, unit="", label_key="label", value_key="value"):
         )
         for lbl, v in rows
     ]
-    return Div(*cols, cls="chart chart-bar")
+    return Div(*bars, cls="chart chart-bar")
 
 
 def LineChart(data, unit="", height=220, width=720, label_key="label", value_key="value"):
@@ -247,12 +265,12 @@ def LineChart(data, unit="", height=220, width=720, label_key="label", value_key
         return Div("No data for this period.", cls="chart-empty")
     pad_x, pad_y = 36, 18
     peak = max((v for _, v in rows), default=0) or 1.0
-    n = max(len(rows) - 1, 1)
+    span = max(len(rows) - 1, 1)
     plot_w, plot_h = width - pad_x * 2, height - pad_y * 2
 
     pts, dots, labels = [], [], []
     for i, (lbl, v) in enumerate(rows):
-        x = pad_x + (i / n) * plot_w
+        x = pad_x + (i / span) * plot_w
         y = pad_y + plot_h - (v / peak) * plot_h
         pts.append(f"{x:.1f},{y:.1f}")
         dots.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3.5" class="line-dot"/>')
@@ -269,21 +287,23 @@ def LineChart(data, unit="", height=220, width=720, label_key="label", value_key
     return Div(NotStr(svg), Div(f"Peak: {peak:g}{unit}", cls="chart-note"))
 
 
-# ---------------- page shell ----------------
-def Page(title, subtitle="", *body, active="/", actions=None, cta=None):
+# ---------------- Page shell ----------------
+def Page(title, *content, subtitle=None, active="/", actions=None, role="student"):
+    visible_nav = [n for n in NAV if n[2] == "all" or role == "staff"]
     return Html(
         Head(
             Meta(charset="utf-8"),
             Meta(name="viewport", content="width=device-width, initial-scale=1"),
-            Title(f"{title} | Campus Resource Booking"),
+            Title(f"{title} | Campus Booking"),
             Style(CSS),
         ),
         Body(
             Header(
                 Div(
                     A("Campus Booking", href="/", cls="brand"),
-                    Nav(*[A(label, href=href, cls="nav-link active" if href == active else "nav-link")
-                          for href, label in NAV]),
+                    Nav(*[A(label, href=path, cls="nav-link active" if active == path else "nav-link")
+                          for path, label, _ in visible_nav]),
+                    RoleSwitcher(role, active),
                     cls="header-inner",
                 ),
                 cls="site-header",
@@ -297,9 +317,7 @@ def Page(title, subtitle="", *body, active="/", actions=None, cta=None):
                 ),
                 cls="page-header",
             ),
-            Section(Div(*body, cls="section-wrap"), cls="section-padding"),
-            cta if cta else None,
-            Footer(Div("Campus Resource Booking — built with FastHTML & SQLite", cls="section-wrap"),
-                   cls="site-footer"),
-        ),
+            Main(Div(*content, cls="section-wrap"), cls="section-padding"),
+            Footer(Div(P("Campus Resource Booking — FastHTML + SQLite demo"), cls="section-wrap"), cls="site-footer"),
+        )
     )
