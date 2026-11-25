@@ -2,7 +2,7 @@
 # Campus Resource Booking System
 
 A lightweight web application for booking and managing shared campus resources
-(study rooms, labs, equipment, halls) built with Python, FastHTML, and SQLite.
+(study rooms, labs, equipment, halls) built with Python, FastHTML, and SQLite(Can be changed to Supabase later).
 
 ## Features
 
