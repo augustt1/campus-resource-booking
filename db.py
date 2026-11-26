@@ -7,6 +7,7 @@
 # Supabase Auth (see auth.py); this file only reads and writes
 # our own tables.
 # ------------------------------------------------------------
+import logging
 import os
 import threading
 from datetime import date
@@ -18,6 +19,8 @@ from psycopg2.pool import ThreadedConnectionPool
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 STATUSES = ("confirmed", "completed", "cancelled", "no_show")
 OPEN_HOUR, CLOSE_HOUR = 8, 20
@@ -37,10 +40,15 @@ def _get_pool():
             url = os.environ.get("DATABASE_URL")
             if not url:
                 raise RuntimeError("DATABASE_URL is not set. Copy .env.example to .env and fill it in.")
-            _pool = ThreadedConnectionPool(
-                1, 5, dsn=url, cursor_factory=RealDictCursor, connect_timeout=15,
-                keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3,
-            )
+            try:
+                _pool = ThreadedConnectionPool(
+                    1, 5, dsn=url, cursor_factory=RealDictCursor, connect_timeout=15,
+                    keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3,
+                )
+            except psycopg2.Error:
+                # Log that it failed, but never the connection string (it holds the password).
+                logger.error("Could not connect to the database. Check DATABASE_URL in .env.")
+                raise
         return _pool
 
 
@@ -185,7 +193,7 @@ def list_bookings(upcoming=None, user_id=None, limit=None):
         q += " AND b.user_id = %s"
         p.append(user_id)
     q += " ORDER BY b.booking_date " + ("ASC" if upcoming else "DESC") + ", b.start_time ASC"
-    if limit:
+    if limit is not None:
         q += " LIMIT %s"
         p.append(limit)
     return _run(q, p, fetch="all")
@@ -201,7 +209,7 @@ def has_clash(resource_id, booking_date, start_time, end_time, exclude_id=None):
            WHERE resource_id = %s AND booking_date = %s AND status_id = 1
              AND NOT (end_time <= %s OR start_time >= %s)"""
     p = [resource_id, booking_date, start_time, end_time]
-    if exclude_id:
+    if exclude_id is not None:
         q += " AND booking_id <> %s"
         p.append(exclude_id)
     return _run(q, p, fetch="one")["n"] > 0
@@ -222,6 +230,8 @@ def create_booking(resource_id, user_id, booking_date, start_time, end_time, pur
 
 
 def set_booking_status(bid, status):
+    if status not in STATUSES:
+        raise ValueError(f"Invalid booking status: {status!r}")
     _run(
         "UPDATE bookings SET status_id = (SELECT status_id FROM booking_statuses WHERE code = %s) WHERE booking_id = %s",
         (status, bid),

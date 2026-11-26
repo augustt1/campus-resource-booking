@@ -29,10 +29,15 @@ campus-resource-booking/
 ├── auth.py           # Sign-in and password changes (Supabase Auth)
 ├── db.py             # Database connection and SQL queries
 ├── analytics.py      # KPI and reporting queries
+├── validation.py     # Form input rules (pure functions, easy to test)
 ├── ui.py             # Shared CSS, pickers and reusable UI components
 ├── db/
 │   ├── schema.sql    # Tables, constraints and reference data
 │   └── seed.py       # Demo accounts, resources and bookings
+├── tests/
+│   ├── test_validation.py     # Input and password rules
+│   ├── test_access.py         # Sign-in and student/staff permissions
+│   └── test_booking_rules.py  # SQL rules: CRUD, clashes, analytics
 ├── .env.example      # Template for local settings
 └── requirements.txt
 ```
@@ -66,6 +71,24 @@ campus-resource-booking/
    ```bash
    python main.py
    ```
+
+## Tests
+
+```bash
+pytest -v
+```
+
+- `test_validation.py` and `test_access.py` need no database or network.
+- `test_booking_rules.py` runs the real SQL against the Supabase database in
+  `.env`. Each test runs inside a transaction that is rolled back, so nothing
+  it creates is saved. These tests are skipped if `DATABASE_URL` is not set.
+
+## Error handling
+
+- Form input is checked in `validation.py` before anything is saved, and the
+  person is told what to fix.
+- If a page fails (for example the database cannot be reached) a plain
+  "Something went wrong" page is shown and the details go to the server log.
 
 ## Demo accounts
 

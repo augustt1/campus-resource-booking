@@ -5,15 +5,35 @@
 # ------------------------------------------------------------
 from datetime import date, timedelta
 
-from db import _run, OPEN_HOUR, CLOSE_HOUR
+import db
+from db import OPEN_HOUR, CLOSE_HOUR
+
+
+def _run(*args, **kwargs):
+    return db._run(*args, **kwargs)
 
 
 def _pct(part, whole):
-    return round((part / whole) * 100, 1) if whole else 0.0
+    try:
+        if not whole or whole <= 0:
+            return 0.0
+        return round((part / whole) * 100, 1)
+    except (TypeError, ZeroDivisionError):
+        return 0.0
+
+
+def _clamp(value, default, low, high):
+    """Keep a caller-supplied number inside a sensible range."""
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        value = default
+    return max(low, min(value, high))
 
 
 def kpis(days=30):
     """Headline figures for the last `days` days."""
+    days = _clamp(days, 30, 1, 3650)
     frm = date.today() - timedelta(days=days)
     to = date.today()
     row = _run(
@@ -30,7 +50,7 @@ def kpis(days=30):
 
     total = row["total"]
     booked_hours = float(row["hours"])
-    capacity_hours = n_res * (CLOSE_HOUR - OPEN_HOUR) * days
+    capacity_hours = n_res * max(CLOSE_HOUR - OPEN_HOUR, 1) * days
 
     return {
         "total_bookings": total,
@@ -61,6 +81,7 @@ def bookings_by_type():
 def weekly_trend(weeks=8):
     """Bookings per week (Monday to Sunday) for the last `weeks` weeks,
     including weeks with none."""
+    weeks = _clamp(weeks, 8, 1, 104)
     this_monday = date.today() - timedelta(days=date.today().weekday())
     first_monday = this_monday - timedelta(weeks=weeks - 1)
     rows = _run(
@@ -79,10 +100,11 @@ def weekly_trend(weeks=8):
 
 
 def most_booked(n=3):
+    n = _clamp(n, 3, 1, 100)
     rows = _run(
         """SELECT r.resource_name, r.building, r.room_code, t.name AS resource_type, t.icon,
                   COUNT(*) AS bookings,
-                  SUM(EXTRACT(EPOCH FROM (b.end_time - b.start_time)) / 3600) AS hours
+                  COALESCE(SUM(EXTRACT(EPOCH FROM (b.end_time - b.start_time)) / 3600), 0) AS hours
            FROM bookings b
            JOIN resources r        ON r.resource_id = b.resource_id
            JOIN resource_types t   ON t.type_id = r.type_id

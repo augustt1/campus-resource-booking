@@ -76,6 +76,7 @@ font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;}
 .alert.info{background:#eef4ff;border-color:#cddcff;color:#23417d;}
 .alert.ok{background:#e7f5ec;border-color:#bfe4cd;color:#15663a;}
 .alert.error{background:#fdecee;border-color:#f3c2c7;color:#8e1522;}
+.alert.warn{background:#fff6e0;border-color:#f1dca3;color:#7a5200;}
 .empty{text-align:center;padding:42px 20px;color:var(--muted);}
 .empty .icon{font-size:34px;display:block;margin-bottom:8px;}
 .empty h4{margin:0 0 4px;color:var(--dark);}
@@ -515,6 +516,8 @@ def ProfileMenu(user):
 def Alert(message, kind="info"):
     if not message:
         return None
+    if kind not in ("info", "ok", "warn", "error"):
+        kind = "info"      # never trust a style name taken from the address bar
     return Div(message, cls=f"alert {kind}")
 
 

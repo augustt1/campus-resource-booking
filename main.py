@@ -7,8 +7,8 @@
 # table). Students manage their own bookings; staff can also manage
 # every booking, manage resources and see reports.
 # ------------------------------------------------------------
+import logging
 import os
-import re
 from datetime import date, datetime
 from urllib.parse import quote_plus
 
@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from fasthtml.common import *
 
 import auth
+from validation import parse_date, parse_int, safe_kind, booking_error, resource_error, MAX_CAPACITY
 from db import (
     OPEN_HOUR, CLOSE_HOUR, STATUSES, type_names, get_profile,
     list_resources, get_resource, create_resource, update_resource, delete_resource,
@@ -29,6 +30,9 @@ from ui import (
 
 load_dotenv()
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # Pages that can be opened without signing in.
 PUBLIC_PATHS = [r"/signin", r"/favicon\.ico"]
 
@@ -41,10 +45,27 @@ def require_sign_in(req, sess):
         return RedirectResponse(f"/signin?next={nxt}", status_code=303)
 
 
+def error_page(req, exc):
+    """Shown instead of a bare "Internal Server Error" when a page fails,
+    for example because the database cannot be reached. The details go
+    to the server log, never to the person's screen."""
+    logger.error("Unhandled error on %s %s", req.method, req.url.path, exc_info=exc)
+    user = req.scope.get("session", {}).get("user")
+    page = Page(
+        "Something went wrong",
+        Alert("We could not load this page right now. Nothing you entered has been lost "
+              "elsewhere; please try again in a moment.", "error"),
+        A("Back to dashboard", href="/", cls="btn btn-ghost"),
+        active="", user=user,
+    )
+    return HTMLResponse("<!doctype html>" + to_xml(page), status_code=500)
+
+
 app, rt = fast_app(
     hdrs=(),
     before=Beforeware(require_sign_in, skip=PUBLIC_PATHS),
     secret_key=os.environ.get("SESSION_SECRET"),
+    exception_handlers={Exception: error_page},
 )
 
 
@@ -67,23 +88,30 @@ def staff_only(session, redirect_to="/"):
 def go(path, msg="", kind="ok"):
     """Redirect, optionally carrying a message to show on the next page."""
     if msg:
-        path += ("&" if "?" in path else "?") + f"msg={quote_plus(msg)}&kind={kind}"
+        path += ("&" if "?" in path else "?") + f"msg={quote_plus(msg)}&kind={safe_kind(kind)}"
     return RedirectResponse(path, status_code=303)
 
 
 def _hours(s, e):
-    t0 = datetime.strptime(s, "%H:%M")
-    t1 = datetime.strptime(e, "%H:%M")
-    return max((t1 - t0).total_seconds() / 3600, 0)
+    try:
+        t0 = datetime.strptime(s, "%H:%M")
+        t1 = datetime.strptime(e, "%H:%M")
+        return max((t1 - t0).total_seconds() / 3600, 0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _safe_next(path):
     """Only follow 'next' links that stay inside this site."""
-    return path if path.startswith("/") and not path.startswith("//") else "/"
+    ok = isinstance(path, str) and path.startswith("/") and not path.startswith("//")
+    return path if ok else "/"
 
 
-def _pretty_date(iso):
-    return datetime.fromisoformat(iso).strftime("%a %d %b %Y")
+def _pretty_date(iso, fmt="%a %d %b %Y"):
+    try:
+        return datetime.fromisoformat(iso).strftime(fmt)
+    except (TypeError, ValueError):
+        return str(iso)
 
 
 # ---------------- Sign in / sign out ----------------
@@ -287,6 +315,10 @@ def get(session, msg: str = "", kind: str = "info"):
 def get(session, msg: str = "", kind: str = "info", rtype: str = ""):
     user = current_user(session)
     staff = is_staff(session)
+    types = type_names()
+    unknown_type = bool(rtype) and rtype not in types
+    if unknown_type:
+        rtype = ""
     resources = list_resources(rtype=rtype)
 
     def row(r):
@@ -307,7 +339,9 @@ def get(session, msg: str = "", kind: str = "info", rtype: str = ""):
     rows = [row(r) for r in resources]
 
     blocks = [Alert(msg, kind)] if msg else []
-    blocks.append(Form(SelectField("rtype", type_names(), value=rtype, blank="All types", label="Resource type"),
+    if unknown_type:
+        blocks.append(Alert("Unknown resource type ignored; showing all types.", "warn"))
+    blocks.append(Form(SelectField("rtype", types, value=rtype, blank="All types", label="Resource type"),
                         Button("Filter", cls="btn btn-ghost"),
                         cls="filters", method="get", action="/resources"))
     blocks.append(Card("All resources", DataTable(headers, rows, empty_msg="No resources match that filter."), flush=True))
@@ -328,7 +362,7 @@ def _resource_form(r=None, action="/resources/new"):
             SelectField("resource_type", type_names(), value=g("resource_type")),
             Field("building", value=g("building")),
             Field("room_code", value=g("room_code")),
-            Field("capacity", value=g("capacity", 1), type="number", min=1),
+            Field("capacity", value=g("capacity", 1), type="number", min=1, max=MAX_CAPACITY),
             SelectField("is_active", [("1", "Active"), ("0", "Inactive")],
                         value="1" if g("is_active", True) else "0", label="Status"),
             TextArea_("notes", value=g("notes")),
@@ -350,17 +384,16 @@ def get(session):
 
 
 @rt("/resources/new")
-def post(session, resource_name: str, resource_type: str, capacity: int = 1,
+def post(session, resource_name: str = "", resource_type: str = "", capacity: str = "1",
          building: str = "", room_code: str = "", notes: str = "", is_active: str = "1"):
     guard = staff_only(session, "/resources")
     if guard:
         return guard
-    if not resource_name.strip():
-        return go("/resources", "Resource name is required.", "error")
-    if resource_type not in type_names():
-        return go("/resources", "Choose a valid resource type.", "error")
+    err = resource_error(resource_name, resource_type, capacity, is_active, type_names())
+    if err:
+        return go("/resources", err, "error")
     create_resource(resource_name.strip(), resource_type, building.strip(), room_code.strip(),
-                     max(capacity, 1), notes.strip(), is_active == "1")
+                     int(capacity), notes.strip(), is_active == "1")
     return go("/resources", "Resource created.")
 
 
@@ -377,17 +410,18 @@ def get(rid: int, session):
 
 
 @rt("/resources/{rid}/edit")
-def post(rid: int, session, resource_name: str, resource_type: str, capacity: int = 1,
+def post(rid: int, session, resource_name: str = "", resource_type: str = "", capacity: str = "1",
          building: str = "", room_code: str = "", notes: str = "", is_active: str = "1"):
     guard = staff_only(session, "/resources")
     if guard:
         return guard
-    if not resource_name.strip():
-        return go("/resources", "Resource name is required.", "error")
-    if resource_type not in type_names():
-        return go("/resources", "Choose a valid resource type.", "error")
+    if not get_resource(rid):
+        return go("/resources", "Resource not found.", "error")
+    err = resource_error(resource_name, resource_type, capacity, is_active, type_names())
+    if err:
+        return go("/resources", err, "error")
     update_resource(rid, resource_name.strip(), resource_type, building.strip(), room_code.strip(),
-                     max(capacity, 1), notes.strip(), is_active == "1")
+                     int(capacity), notes.strip(), is_active == "1")
     return go("/resources", "Resource updated.")
 
 
@@ -396,6 +430,8 @@ def post(rid: int, session):
     guard = staff_only(session, "/resources")
     if guard:
         return guard
+    if not get_resource(rid):
+        return go("/resources", "Resource not found.", "error")
     if not delete_resource(rid):
         return go("/resources",
                   "This resource has bookings, so it cannot be deleted. Edit it and set it to Inactive instead.",
@@ -453,6 +489,7 @@ def get(session, msg: str = "", kind: str = "info"):
 @rt("/bookings/new")
 def get(session, msg: str = "", kind: str = "error", resource_id: str = ""):
     user = current_user(session)
+    resource_id = str(parse_int(resource_id, default=""))
     options = [(r["resource_id"], f'{r["icon"]} {r["resource_name"]} ({r["room_code"]})')
                for r in list_resources(active_only=True)]
     form = Form(
@@ -479,36 +516,28 @@ def get(session, msg: str = "", kind: str = "error", resource_id: str = ""):
 
 
 @rt("/bookings/new")
-def post(session, resource_id: int, booking_date: str, start_time: str, end_time: str, purpose: str = ""):
+def post(session, resource_id: str = "", booking_date: str = "", start_time: str = "",
+         end_time: str = "", purpose: str = ""):
     user = current_user(session)
-    time_ok = re.compile(r"^\d{2}:\d{2}$")
-    err = None
-    try:
-        booking_day = date.fromisoformat(booking_date)
-    except ValueError:
-        booking_day = None
+    start_time, end_time = start_time.strip(), end_time.strip()
+    rid = parse_int(resource_id)
+    resource = get_resource(rid) if rid else None
 
-    resource = get_resource(resource_id)
     if not resource or not resource["is_active"]:
         err = "That resource is not available to book."
-    elif booking_day is None or not time_ok.match(start_time) or not time_ok.match(end_time):
-        err = "Choose a valid date and times."
-    elif end_time <= start_time:
-        err = "End time must be after start time."
-    elif not (f"{OPEN_HOUR:02d}:00" <= start_time and end_time <= f"{CLOSE_HOUR:02d}:00"):
-        err = f"Bookings must fall within campus hours ({OPEN_HOUR:02d}:00–{CLOSE_HOUR:02d}:00)."
-    elif booking_day < date.today():
-        err = "Booking date cannot be in the past."
-    elif has_clash(resource_id, booking_date, start_time, end_time):
+    else:
+        err = booking_error(booking_date, start_time, end_time, purpose,
+                            open_hour=OPEN_HOUR, close_hour=CLOSE_HOUR)
+    if not err and has_clash(rid, booking_date, start_time, end_time):
         err = "That resource is already booked for this time slot."
 
-    if not err and not create_booking(resource_id, user["user_id"], booking_date,
+    if not err and not create_booking(rid, user["user_id"], booking_date.strip(),
                                       start_time, end_time, purpose.strip()):
         # The database's own no-overlap rule caught a booking made a moment earlier.
         err = "That resource has just been booked for this time slot."
 
     if err:
-        return go(f"/bookings/new?resource_id={resource_id}", err, "error")
+        return go(f"/bookings/new?resource_id={rid}" if rid else "/bookings/new", err, "error")
     return go("/bookings", "Booking confirmed.")
 
 
@@ -518,10 +547,9 @@ def post(bid: int, session, to: str = "cancelled"):
     booking = get_booking(bid)
     if not booking:
         return go("/bookings", "Booking not found.", "error")
-    if is_staff(session):
-        if to not in STATUSES:
-            to = "cancelled"
-    else:
+    if to not in STATUSES:
+        return go("/bookings", "That is not a valid booking status.", "error")
+    if not is_staff(session):
         # Students may only cancel their own upcoming bookings.
         if booking["user_id"] != user["user_id"] or to != "cancelled" or booking["status"] != "confirmed":
             return go("/bookings", "You can only cancel your own upcoming bookings.", "error")
@@ -534,10 +562,15 @@ def post(bid: int, session, to: str = "cancelled"):
 def get(session, d: str = "", rtype: str = ""):
     user = current_user(session)
     staff = is_staff(session)
-    try:
-        d = date.fromisoformat(d).isoformat()
-    except ValueError:
-        d = date.today().isoformat()
+    notices = []
+    day = parse_date(d)
+    if d and day is None:
+        notices.append(Alert("That date was not valid, so today is shown instead.", "warn"))
+    d = (day or date.today()).isoformat()
+    types = type_names()
+    if rtype and rtype not in types:
+        notices.append(Alert("Unknown resource type ignored; showing all types.", "warn"))
+        rtype = ""
     rows = []
     for r in list_resources(active_only=True, rtype=rtype):
         slots = slots_for(r["resource_id"], d)
@@ -550,19 +583,19 @@ def get(session, d: str = "", rtype: str = ""):
         rows.append(Tr(
             Cell(f'{r["icon"]} {r["resource_name"]}', f'{r["building"]} {r["room_code"]}'),
             Td(*slot_spans),
-            Td(f'{(CLOSE_HOUR - OPEN_HOUR) - used:g} hrs free'),
+            Td(f'{max((CLOSE_HOUR - OPEN_HOUR) - used, 0):g} hrs free'),
             Td(A("Book", href=f'/bookings/new?resource_id={r["resource_id"]}', cls="btn btn-primary btn-sm")),
         ))
 
     form = Form(
         Field("d", value=d, type="date", label="Date"),
-        SelectField("rtype", type_names(), value=rtype, blank="All types", label="Resource type"),
+        SelectField("rtype", types, value=rtype, blank="All types", label="Resource type"),
         Button("Search", cls="btn btn-primary", style="align-self:flex-end"),
         cls="filters", method="get", action="/availability",
     )
-    pretty = datetime.fromisoformat(d).strftime("%A %d %B %Y")
+    pretty = _pretty_date(d, "%A %d %B %Y")
     return Page(
-        "Availability", Card("Filters", form),
+        "Availability", *notices, Card("Filters", form),
         Card(f"Resources on {pretty}", DataTable(["Resource", "Booked slots", "Free hours", ""], rows,
                                                     empty_msg="No active resources match that filter.")),
         subtitle="Check free and booked slots by date.",
@@ -604,6 +637,6 @@ def get(session):
 
 # ---------------- Entry point ----------------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT") or os.environ.get("APP_PORT") or 8080)
+    port = parse_int(os.environ.get("PORT") or os.environ.get("APP_PORT"), default=8080, max_val=65535)
     is_cloud = "PORT" in os.environ
     serve(host="0.0.0.0", port=port, reload=not is_cloud)
