@@ -1,6 +1,5 @@
 python-fasthtml>=0.12.0
 python-dotenv>=1.0.1
-pytest>=8.2.0
-
-# Needed only when the database layer is connected (Stage 2)
 psycopg2-binary>=2.9.9
+httpx>=0.27
+pytest>=8.2.0

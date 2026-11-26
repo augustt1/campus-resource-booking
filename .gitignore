@@ -4,3 +4,4 @@ __pycache__/
 campus.db
 .DS_Store
 .env
+.sesskey
