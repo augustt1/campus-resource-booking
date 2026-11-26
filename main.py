@@ -1,76 +1,95 @@
 # main.py
 # ------------------------------------------------------------
 # Application entry point and route handlers.
-# Role-based access control: "student" (default) vs "staff".
-# No real login/password — role is chosen via a simple switcher
-# stored in the session (documented as a design trade-off).
+#
+# Access control: everyone must sign in (Supabase Auth, see auth.py).
+# Each account is a "student" or "staff" (stored in the `profiles`
+# table). Students manage their own bookings; staff can also manage
+# every booking, manage resources and see reports.
 # ------------------------------------------------------------
 import logging
 import os
-import re
 from datetime import date, datetime
 from urllib.parse import quote_plus
 
+from dotenv import load_dotenv
 from fasthtml.common import *
 
+import auth
+from validation import parse_date, parse_int, safe_kind, booking_error, resource_error, MAX_CAPACITY
 from db import (
-    init_db, TYPES, OPEN_HOUR, CLOSE_HOUR, STATUSES, TYPE_ICON,
+    OPEN_HOUR, CLOSE_HOUR, STATUSES, type_names, get_profile,
     list_resources, get_resource, create_resource, update_resource, delete_resource,
     list_bookings, get_booking, has_clash, create_booking, set_booking_status, slots_for,
 )
 from analytics import kpis, bookings_by_type, weekly_trend, most_booked, by_building
 from ui import (
-    Page, Alert, Empty, Card, StatItem, StatsRow, StatusBadge, Cell, DataTable,
-    Field, SelectField, TextArea_, ListingCard, BarChart, LineChart, is_staff,
+    Page, Alert, Card, StatItem, StatsRow, StatusBadge, Cell, DataTable, DetailList,
+    Field, SelectField, TextArea_, ListingCard, BarChart, LineChart,
 )
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialise database/storage safely at startup
-try:
-    init_db()
-except Exception as exc:
-    logger.exception("Failed to initialise database on startup: %s", exc)
-
-app, rt = fast_app(hdrs=())
-
-TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+# Pages that can be opened without signing in.
+PUBLIC_PATHS = [r"/signin", r"/favicon\.ico"]
 
 
-def _redirect_msg(path: str, msg: str, kind: str = "error") -> RedirectResponse:
-    sep = "&" if "?" in path else "?"
-    return RedirectResponse(f"{path}{sep}msg={quote_plus(msg)}&kind={quote_plus(kind)}", status_code=303)
+def require_sign_in(req, sess):
+    """Runs before every page: visitors who are not signed in are sent
+    to the sign-in page, and brought back afterwards."""
+    if not sess.get("user"):
+        nxt = quote_plus(req.url.path)
+        return RedirectResponse(f"/signin?next={nxt}", status_code=303)
 
 
-def _parse_iso_date(raw: str, fallback: date | None = None) -> date | None:
-    if not raw or not isinstance(raw, str):
-        return fallback
-    try:
-        return date.fromisoformat(raw.strip())
-    except ValueError:
-        return fallback
+def error_page(req, exc):
+    """Shown instead of a bare "Internal Server Error" when a page fails,
+    for example because the database cannot be reached. The details go
+    to the server log, never to the person's screen."""
+    logger.error("Unhandled error on %s %s", req.method, req.url.path, exc_info=exc)
+    user = req.scope.get("session", {}).get("user")
+    page = Page(
+        "Something went wrong",
+        Alert("We could not load this page right now. Nothing you entered has been lost "
+              "elsewhere; please try again in a moment.", "error"),
+        A("Back to dashboard", href="/", cls="btn btn-ghost"),
+        active="", user=user,
+    )
+    return HTMLResponse("<!doctype html>" + to_xml(page), status_code=500)
 
 
-def _parse_hhmm(raw: str) -> str | None:
-    if not raw or not isinstance(raw, str):
-        return None
-    val = raw.strip()
-    if not TIME_RE.match(val):
-        return None
-    return val
+app, rt = fast_app(
+    hdrs=(),
+    before=Beforeware(require_sign_in, skip=PUBLIC_PATHS),
+    secret_key=os.environ.get("SESSION_SECRET"),
+    exception_handlers={Exception: error_page},
+)
 
 
-def _parse_positive_int(raw, default: int | None = None, min_val: int = 1, max_val: int = 100_000) -> int | None:
-    if raw is None or raw == "":
-        return default
-    try:
-        num = int(raw)
-    except (TypeError, ValueError):
-        return default
-    if num < min_val or num > max_val:
-        return default
-    return num
+# ---------------- helpers ----------------
+def current_user(session):
+    return session.get("user")
+
+
+def is_staff(session):
+    user = session.get("user")
+    return bool(user) and user["role"] == "staff"
+
+
+def staff_only(session, redirect_to="/"):
+    if not is_staff(session):
+        return go(redirect_to, "Staff access only.", "error")
+    return None
+
+
+def go(path, msg="", kind="ok"):
+    """Redirect, optionally carrying a message to show on the next page."""
+    if msg:
+        path += ("&" if "?" in path else "?") + f"msg={quote_plus(msg)}&kind={safe_kind(kind)}"
+    return RedirectResponse(path, status_code=303)
 
 
 def _hours(s, e):
@@ -78,169 +97,259 @@ def _hours(s, e):
         t0 = datetime.strptime(s, "%H:%M")
         t1 = datetime.strptime(e, "%H:%M")
         return max((t1 - t0).total_seconds() / 3600, 0)
-    except Exception:
+    except (TypeError, ValueError):
         return 0.0
 
 
-def _format_display_date(iso_str: str, fmt: str = "%a %d %b %Y") -> str:
+def _safe_next(path):
+    """Only follow 'next' links that stay inside this site."""
+    ok = isinstance(path, str) and path.startswith("/") and not path.startswith("//")
+    return path if ok else "/"
+
+
+def _pretty_date(iso, fmt="%a %d %b %Y"):
     try:
-        return datetime.fromisoformat(iso_str).strftime(fmt)
-    except Exception:
-        return str(iso_str)
+        return datetime.fromisoformat(iso).strftime(fmt)
+    except (TypeError, ValueError):
+        return str(iso)
 
 
-def staff_only(session, redirect_to="/"):
-    if not is_staff(session):
-        return _redirect_msg(redirect_to, "Staff access only.", "error")
-    return None
+# ---------------- Sign in / sign out ----------------
+@rt("/signin")
+def get(session, msg: str = "", kind: str = "error", next: str = "/"):
+    if current_user(session):
+        return go(_safe_next(next))
+    form = Form(
+        Div(
+            Field("email", type="email", autocomplete="username", required=True, autofocus=True),
+            Field("password", type="password", autocomplete="current-password", required=True),
+            cls="form-grid",
+        ),
+        Hidden(name="next", value=next),
+        Button("Sign in", cls="btn btn-primary"),
+        method="post", action="/signin",
+    )
+    return Page(
+        "Sign in",
+        Div(
+            Alert(msg, kind) if msg else None,
+            Card("Welcome back", form),
+            P("Accounts are issued by the university. Contact Learning Resources if you cannot sign in.",
+              cls="auth-note"),
+            cls="auth-wrap",
+        ),
+        subtitle="Use your university email and password.",
+        active="",
+    )
 
 
-# ---------------- Role switcher ----------------
-@rt("/role/{role}")
-def get(role: str, session, next: str = "/"):
-    if role in ("student", "staff"):
-        session["role"] = role
-    # Prevent open redirects by ensuring `next` is a relative local path
-    safe_next = next if (isinstance(next, str) and next.startswith("/") and not next.startswith("//")) else "/"
-    return RedirectResponse(safe_next, status_code=303)
+@rt("/signin")
+def post(session, email: str = "", password: str = "", next: str = "/"):
+    email = email.strip().lower()
+    back = f"/signin?next={quote_plus(next)}"
+    if not email or not password:
+        return go(back, "Enter your email and password.", "error")
+    try:
+        result = auth.sign_in(email, password)
+    except auth.AuthUnavailable:
+        return go(back, "Sign-in is unavailable right now. Please try again shortly.", "error")
+
+    profile = get_profile(result["user_id"]) if result else None
+    if not profile:
+        # One message for every failure, so nobody can discover which emails have accounts.
+        return go(back, "Email or password is incorrect.", "error")
+
+    session["user"] = {
+        "user_id": profile["user_id"],
+        "first_name": profile["first_name"],
+        "last_name": profile["last_name"],
+        "email": email,
+        "role": profile["role"],
+    }
+    return go(_safe_next(next))
+
+
+@rt("/signout")
+def post(session):
+    session.clear()
+    return go("/signin", "You have signed out.", "info")
+
+
+# ---------------- Account ----------------
+@rt("/account")
+def get(session, msg: str = "", kind: str = "info"):
+    user = current_user(session)
+    profile = get_profile(user["user_id"])
+    details = DetailList([
+        ("Name", f'{profile["first_name"]} {profile["last_name"]}'),
+        ("Email", user["email"]),
+        ("University ID", profile["university_id"]),
+        ("Role", profile["role"].title()),
+        ("Department", profile["department"]),
+        ("Course", profile["course"] if profile["role"] == "student" else "Not applicable"),
+    ])
+    return Page(
+        "Account",
+        Alert(msg, kind) if msg else None,
+        Card("Your details", details, hint="Managed by the university"),
+        Card("Security",
+             P("Change the password you use to sign in.", cls="muted", style="margin-bottom:14px"),
+             A("Change password", href="/account/password", cls="btn btn-ghost")),
+        subtitle="Your profile and sign-in settings.",
+        active="", user=user,
+    )
+
+
+@rt("/account/password")
+def get(session, msg: str = "", kind: str = "error"):
+    user = current_user(session)
+    form = Form(
+        Div(
+            Field("current_password", type="password", autocomplete="current-password", required=True),
+            Field("new_password", type="password", autocomplete="new-password", required=True),
+            Field("confirm_password", type="password", autocomplete="new-password", required=True,
+                  label="Confirm new password"),
+            cls="form-grid",
+        ),
+        P("Your new password needs:", cls="muted", style="margin:16px 0 0;font-size:13px"),
+        Ul(*[Li(rule) for rule in auth.PASSWORD_RULES], cls="rules"),
+        Button("Update password", cls="btn btn-primary"),
+        method="post", action="/account/password",
+    )
+    return Page(
+        "Change password",
+        Div(Alert(msg, kind) if msg else None, Card("Choose a new password", form), cls="auth-wrap"),
+        active="", user=user,
+    )
+
+
+@rt("/account/password")
+def post(session, current_password: str = "", new_password: str = "", confirm_password: str = ""):
+    user = current_user(session)
+    back = "/account/password"
+    if not current_password or not new_password:
+        return go(back, "Fill in every field.", "error")
+    if new_password != confirm_password:
+        return go(back, "The two new passwords do not match.", "error")
+    if new_password == current_password:
+        return go(back, "Your new password must be different from the current one.", "error")
+    problems = auth.password_problems(new_password)
+    if problems:
+        return go(back, "Your new password still needs: " + ", ".join(p.lower() for p in problems) + ".", "error")
+    try:
+        # Prove it really is the account owner by checking the current password first.
+        result = auth.sign_in(user["email"], current_password)
+        if not result:
+            return go(back, "Your current password is incorrect.", "error")
+        if not auth.change_password(result["access_token"], new_password):
+            return go(back, "The password could not be changed. Please try again.", "error")
+    except auth.AuthUnavailable:
+        return go(back, "The sign-in service is unavailable right now. Please try again shortly.", "error")
+    return go("/account", "Your password has been changed.", "ok")
 
 
 # ---------------- Dashboard ----------------
 @rt("/")
 def get(session, msg: str = "", kind: str = "info"):
-    role = session.get("role", "student")
-    safe_kind = kind if kind in ("info", "ok", "warn", "error") else "info"
-
-    try:
-        k = kpis()
-        upcoming = list_bookings(upcoming=True, limit=6)
-        popular = most_booked(3)
-        trend = weekly_trend(8)
-    except Exception as exc:
-        logger.exception("Dashboard data load failed: %s", exc)
-        return Page(
-            "Dashboard",
-            Alert("Unable to load dashboard data right now. Please try again later.", "error"),
-            subtitle="Service-wide overview and your bookings, all on one page.",
-            active="/", role=role,
-        )
-
+    user = current_user(session)
+    upcoming = list_bookings(upcoming=True, user_id=user["user_id"], limit=6)
     rows = [
-        Tr(
-            Cell(b["resource_name"], f'{b["building"]} {b["room_code"]}'),
-            Td(_format_display_date(b["booking_date"])),
-            Td(f'{b["start_time"]}–{b["end_time"]}'),
-            Td(b["user_name"]),
-        )
+        Tr(Cell(b["resource_name"], f'{b["building"]} {b["room_code"]}'),
+           Td(_pretty_date(b["booking_date"])),
+           Td(f'{b["start_time"]}–{b["end_time"]}'),
+           Td(b["purpose"] or "—"))
         for b in upcoming
     ]
     popular_cards = [
         ListingCard(
-            icon=TYPE_ICON.get(r["resource_type"], "📦"),
+            icon=r["icon"],
             title=r["resource_name"],
             meta=f'{r["building"]} {r["room_code"]}',
             body=f'{r["hours"]:g} hours booked recently',
-            action=A("Check availability", href=f'/availability?rtype={quote_plus(r["resource_type"])}', cls="btn btn-ghost btn-sm"),
+            action=A("Check availability", href=f'/availability?rtype={quote_plus(r["resource_type"])}',
+                     cls="btn btn-ghost btn-sm"),
         )
-        for r in popular
+        for r in most_booked(3)
     ]
 
-    blocks = [Alert(msg, safe_kind)] if msg else []
+    blocks = [Alert(msg, kind)] if msg else []
 
     if is_staff(session):
+        k = kpis()
         blocks.append(Card(
             "Service overview",
             StatsRow(
                 StatItem("📅", k["total_bookings"], label="Total bookings",
-                         note=f'{k["period_from"]} – {k["period_to"]}'),
+                          note=f'{k["period_from"]} – {k["period_to"]}'),
                 StatItem("📈", k["utilisation_rate"], unit="%", label="Utilisation",
-                         note=f'{k["booked_hours"]:g} hours'),
+                          note=f'{k["booked_hours"]:g} hours'),
                 StatItem("↩️", k["cancellation_rate"], unit="%", label="Cancellation rate",
-                         note=f'{k["cancelled_bookings"]} cancelled',
-                         tone="warn" if k["cancellation_rate"] > 12 else ""),
+                          note=f'{k["cancelled_bookings"]} cancelled',
+                          tone="warn" if k["cancellation_rate"] > 12 else ""),
                 StatItem("❓", k["no_show_rate"], unit="%", label="No-show rate",
-                         note=f'{k["no_show_bookings"]} not attended',
-                         tone="warn" if k["no_show_rate"] > 8 else ""),
+                          note=f'{k["no_show_bookings"]} not attended',
+                          tone="warn" if k["no_show_rate"] > 8 else ""),
             ),
             hint="Last 30 days",
         ))
-        blocks.append(Card("Weekly booking trend", LineChart(trend), hint="Last 8 weeks"))
+        blocks.append(Card("Weekly booking trend", LineChart(weekly_trend(8)), hint="Last 8 weeks"))
 
     blocks.append(Card("My upcoming bookings",
-                       DataTable(["Resource", "Date", "Time", "Booked by"], rows,
-                                 empty_msg="No upcoming bookings yet."), flush=True))
-    blocks.append(Card("Most in-demand resources", Div(*popular_cards, cls="listing-grid")))
+                        DataTable(["Resource", "Date", "Time", "Purpose"], rows,
+                                   empty_msg="You have no upcoming bookings."), flush=True))
+    blocks.append(Card("Most in-demand resources",
+                        Div(*popular_cards, cls="listing-grid") if popular_cards
+                        else P("No bookings have been made yet.", cls="muted")))
 
     return Page(
-        "Dashboard", *blocks,
-        subtitle="Service-wide overview and your bookings, all on one page.",
-        active="/", role=role,
-        actions=[
-            A("+ New booking", href="/bookings/new", cls="btn btn-primary"),
-            A("Check availability", href="/availability", cls="btn btn-ghost"),
-        ],
+        f'Welcome, {user["first_name"]}', *blocks,
+        subtitle="Your bookings and what is in demand across campus.",
+        active="/", user=user,
+        actions=[A("+ New booking", href="/bookings/new", cls="btn btn-primary"),
+                 A("Check availability", href="/availability", cls="btn btn-ghost")],
     )
 
 
 # ---------------- Resources ----------------
 @rt("/resources")
 def get(session, msg: str = "", kind: str = "info", rtype: str = ""):
-    role = session.get("role", "student")
+    user = current_user(session)
     staff = is_staff(session)
-    safe_kind = kind if kind in ("info", "ok", "warn", "error") else "info"
-    valid_types = {t[0] if isinstance(t, (tuple, list)) else t for t in TYPES}
-    clean_rtype = rtype if rtype in valid_types else ""
-
-    try:
-        resources = list_resources(rtype=clean_rtype)
-    except Exception as exc:
-        logger.exception("Failed to list resources: %s", exc)
-        return Page(
-            "Resources",
-            Alert("Could not load resources due to a storage error.", "error"),
-            subtitle="Browse all bookable resources on campus.",
-            active="/resources", role=role,
-        )
+    types = type_names()
+    unknown_type = bool(rtype) and rtype not in types
+    if unknown_type:
+        rtype = ""
+    resources = list_resources(rtype=rtype)
 
     def row(r):
         cells = [
-            Cell(f'{TYPE_ICON.get(r["resource_type"], "📦")} {r["resource_name"]}', r["notes"] or ""),
+            Cell(f'{r["icon"]} {r["resource_name"]}', r["notes"] or ""),
             Td(r["resource_type"]), Td(r["room_code"]), Td(r["capacity"]),
             Td(StatusBadge("confirmed" if r["is_active"] else "inactive")),
         ]
         if staff:
             cells.append(Td(
                 A("Edit", href=f'/resources/{r["resource_id"]}/edit', cls="btn btn-ghost btn-sm"),
-                Form(
-                    Button("Delete", cls="btn btn-danger btn-sm"),
-                    method="post", action=f'/resources/{r["resource_id"]}/delete',
-                    style="display:inline",
-                ),
+                Form(Button("Delete", cls="btn btn-danger btn-sm"),
+                     method="post", action=f'/resources/{r["resource_id"]}/delete', style="display:inline"),
             ))
         return Tr(*cells)
 
     headers = ["Resource", "Type", "Room", "Capacity", "Status"] + (["Actions"] if staff else [])
     rows = [row(r) for r in resources]
 
-    blocks = [Alert(msg, safe_kind)] if msg else []
-    if rtype and not clean_rtype:
-        blocks.append(Alert("Unknown resource type filter ignored; showing all types.", "warn"))
-
-    blocks.append(Form(
-        SelectField("rtype", TYPES, value=clean_rtype, blank="All types"),
-        Button("Filter", cls="btn btn-ghost"),
-        cls="filters", method="get", action="/resources",
-    ))
-    blocks.append(Card(
-        "All resources",
-        DataTable(headers, rows, empty_msg="No resources match that filter."),
-        flush=True,
-    ))
+    blocks = [Alert(msg, kind)] if msg else []
+    if unknown_type:
+        blocks.append(Alert("Unknown resource type ignored; showing all types.", "warn"))
+    blocks.append(Form(SelectField("rtype", types, value=rtype, blank="All types", label="Resource type"),
+                        Button("Filter", cls="btn btn-ghost"),
+                        cls="filters", method="get", action="/resources"))
+    blocks.append(Card("All resources", DataTable(headers, rows, empty_msg="No resources match that filter."), flush=True))
 
     return Page(
         "Resources", *blocks,
         subtitle="Browse all bookable resources on campus.",
-        active="/resources", role=role,
+        active="/resources", user=user,
         actions=[A("+ Add resource", href="/resources/new", cls="btn btn-primary")] if staff else None,
     )
 
@@ -250,11 +359,12 @@ def _resource_form(r=None, action="/resources/new"):
     return Form(
         Div(
             Field("resource_name", value=g("resource_name")),
-            SelectField("resource_type", TYPES, value=g("resource_type")),
+            SelectField("resource_type", type_names(), value=g("resource_type")),
             Field("building", value=g("building")),
             Field("room_code", value=g("room_code")),
-            Field("capacity", value=g("capacity", 1)),
-            SelectField("is_active", [("1", "Active"), ("0", "Inactive")], value=str(g("is_active", 1))),
+            Field("capacity", value=g("capacity", 1), type="number", min=1, max=MAX_CAPACITY),
+            SelectField("is_active", [("1", "Active"), ("0", "Inactive")],
+                        value="1" if g("is_active", True) else "0", label="Status"),
             TextArea_("notes", value=g("notes")),
             cls="form-grid",
         ),
@@ -264,51 +374,27 @@ def _resource_form(r=None, action="/resources/new"):
     )
 
 
-def _validate_resource_payload(resource_name: str, resource_type: str, capacity, is_active: str):
-    valid_types = {t[0] if isinstance(t, (tuple, list)) else t for t in TYPES}
-    cap = _parse_positive_int(capacity, default=None, min_val=1, max_val=10_000)
-    if not resource_name or not resource_name.strip():
-        return "Resource name is required."
-    if len(resource_name.strip()) > 120:
-        return "Resource name must be 120 characters or fewer."
-    if resource_type not in valid_types:
-        return "Invalid resource type selected."
-    if cap is None:
-        return "Capacity must be a positive whole number (1–10,000)."
-    if str(is_active) not in ("0", "1"):
-        return "Invalid active status."
-    return None
-
-
 @rt("/resources/new")
 def get(session):
     guard = staff_only(session, "/resources")
     if guard:
         return guard
-    return Page("New resource", Card("Add a new bookable item", _resource_form()), active="/resources", role="staff")
+    return Page("New resource", Card("Add a new bookable item", _resource_form()),
+                active="/resources", user=current_user(session))
 
 
 @rt("/resources/new")
-def post(session, resource_name: str = "", resource_type: str = "", capacity: int = 1,
+def post(session, resource_name: str = "", resource_type: str = "", capacity: str = "1",
          building: str = "", room_code: str = "", notes: str = "", is_active: str = "1"):
     guard = staff_only(session, "/resources")
     if guard:
         return guard
-
-    err = _validate_resource_payload(resource_name, resource_type, capacity, is_active)
+    err = resource_error(resource_name, resource_type, capacity, is_active, type_names())
     if err:
-        return _redirect_msg("/resources", err, "error")
-
-    try:
-        create_resource(
-            resource_name.strip(), resource_type, building.strip(), room_code.strip(),
-            int(capacity), notes.strip(), int(is_active),
-        )
-    except Exception as exc:
-        logger.exception("Failed to create resource: %s", exc)
-        return _redirect_msg("/resources", "Could not save new resource due to a storage error.", "error")
-
-    return _redirect_msg("/resources", "Resource created", "ok")
+        return go("/resources", err, "error")
+    create_resource(resource_name.strip(), resource_type, building.strip(), room_code.strip(),
+                     int(capacity), notes.strip(), is_active == "1")
+    return go("/resources", "Resource created.")
 
 
 @rt("/resources/{rid}/edit")
@@ -316,48 +402,27 @@ def get(rid: int, session):
     guard = staff_only(session, "/resources")
     if guard:
         return guard
-    if rid <= 0:
-        return _redirect_msg("/resources", "Invalid resource ID.", "error")
-
-    try:
-        r = get_resource(rid)
-    except Exception as exc:
-        logger.exception("Failed to fetch resource %s: %s", rid, exc)
-        return _redirect_msg("/resources", "Could not load resource due to a storage error.", "error")
-
+    r = get_resource(rid)
     if not r:
-        return _redirect_msg("/resources", "Resource not found", "error")
-
-    return Page(
-        f'Edit "{r["resource_name"]}"',
-        Card("Update details", _resource_form(r, f"/resources/{rid}/edit")),
-        active="/resources", role="staff",
-    )
+        return go("/resources", "Resource not found.", "error")
+    return Page(f'Edit "{r["resource_name"]}"', Card("Update details", _resource_form(r, f"/resources/{rid}/edit")),
+                active="/resources", user=current_user(session))
 
 
 @rt("/resources/{rid}/edit")
-def post(rid: int, session, resource_name: str = "", resource_type: str = "", capacity: int = 1,
+def post(rid: int, session, resource_name: str = "", resource_type: str = "", capacity: str = "1",
          building: str = "", room_code: str = "", notes: str = "", is_active: str = "1"):
     guard = staff_only(session, "/resources")
     if guard:
         return guard
-    if rid <= 0:
-        return _redirect_msg("/resources", "Invalid resource ID.", "error")
-
-    err = _validate_resource_payload(resource_name, resource_type, capacity, is_active)
+    if not get_resource(rid):
+        return go("/resources", "Resource not found.", "error")
+    err = resource_error(resource_name, resource_type, capacity, is_active, type_names())
     if err:
-        return _redirect_msg("/resources", err, "error")
-
-    try:
-        update_resource(
-            rid, resource_name.strip(), resource_type, building.strip(), room_code.strip(),
-            int(capacity), notes.strip(), int(is_active),
-        )
-    except Exception as exc:
-        logger.exception("Failed to update resource %s: %s", rid, exc)
-        return _redirect_msg("/resources", "Could not update resource due to a storage error.", "error")
-
-    return _redirect_msg("/resources", "Resource updated", "ok")
+        return go("/resources", err, "error")
+    update_resource(rid, resource_name.strip(), resource_type, building.strip(), room_code.strip(),
+                     int(capacity), notes.strip(), is_active == "1")
+    return go("/resources", "Resource updated.")
 
 
 @rt("/resources/{rid}/delete")
@@ -365,113 +430,79 @@ def post(rid: int, session):
     guard = staff_only(session, "/resources")
     if guard:
         return guard
-    if rid <= 0:
-        return _redirect_msg("/resources", "Invalid resource ID.", "error")
-
-    try:
-        delete_resource(rid)
-    except Exception as exc:
-        logger.exception("Failed to delete resource %s: %s", rid, exc)
-        return _redirect_msg("/resources", "Could not delete resource (it may have linked bookings).", "error")
-
-    return _redirect_msg("/resources", "Resource deleted", "ok")
+    if not get_resource(rid):
+        return go("/resources", "Resource not found.", "error")
+    if not delete_resource(rid):
+        return go("/resources",
+                  "This resource has bookings, so it cannot be deleted. Edit it and set it to Inactive instead.",
+                  "error")
+    return go("/resources", "Resource deleted.")
 
 
 # ---------------- Bookings ----------------
 @rt("/bookings")
 def get(session, msg: str = "", kind: str = "info"):
-    role = session.get("role", "student")
+    user = current_user(session)
     staff = is_staff(session)
-    safe_kind = kind if kind in ("info", "ok", "warn", "error") else "info"
-
-    try:
-        upcoming = list_bookings(upcoming=True)
-        history = list_bookings(upcoming=False, limit=15)
-    except Exception as exc:
-        logger.exception("Failed to load bookings: %s", exc)
-        return Page(
-            "Bookings",
-            Alert("Unable to load bookings right now due to a storage error.", "error"),
-            subtitle="All reservations across the campus estate.",
-            active="/bookings", role=role,
-        )
+    # Staff see every booking; students see only their own.
+    only_user = None if staff else user["user_id"]
+    upcoming = list_bookings(upcoming=True, user_id=only_user)
+    history = list_bookings(upcoming=False, user_id=only_user, limit=15)
 
     def row(b, show_actions):
         cells = [
             Cell(b["resource_name"], f'{b["building"]} {b["room_code"]}'),
-            Td(_format_display_date(b["booking_date"])),
+            Td(_pretty_date(b["booking_date"])),
             Td(f'{b["start_time"]}–{b["end_time"]}'),
-            Cell(b["user_name"], b["purpose"] or ""),
-            Td(StatusBadge(b["status"])),
         ]
-        if show_actions and staff:
-            if b["status"] == "confirmed":
-                cells.append(Td(
-                    Form(
-                        Button("Cancel", cls="btn btn-danger btn-sm"),
-                        method="post", action=f'/bookings/{b["booking_id"]}/status?to=cancelled',
-                        style="display:inline",
-                    ),
-                    Form(
-                        Button("Complete", cls="btn btn-ghost btn-sm"),
-                        method="post", action=f'/bookings/{b["booking_id"]}/status?to=completed',
-                        style="display:inline",
-                    ),
-                ))
-            else:
-                cells.append(Td(""))
+        if staff:
+            cells.append(Cell(b["user_name"], b["university_id"]))
+        cells += [Td(b["purpose"] or "—"), Td(StatusBadge(b["status"]))]
+        if show_actions:
+            buttons = [Form(Button("Cancel", cls="btn btn-danger btn-sm"), method="post",
+                            action=f'/bookings/{b["booking_id"]}/status?to=cancelled', style="display:inline")]
+            if staff:
+                buttons.append(Form(Button("Complete", cls="btn btn-ghost btn-sm"), method="post",
+                                    action=f'/bookings/{b["booking_id"]}/status?to=completed',
+                                    style="display:inline"))
+            cells.append(Td(*buttons))
         return Tr(*cells)
 
-    up_headers = ["Resource", "Date", "Time", "Booked by", "Status"] + (["Actions"] if staff else [])
-    hist_headers = ["Resource", "Date", "Time", "Booked by", "Status"]
+    base = ["Resource", "Date", "Time"] + (["Booked by"] if staff else []) + ["Purpose", "Status"]
 
-    blocks = [Alert(msg, safe_kind)] if msg else []
-    blocks.append(Card(
-        "Upcoming bookings",
-        DataTable(up_headers, [row(b, True) for b in upcoming], empty_msg="No upcoming bookings."),
-        flush=True,
-    ))
-    blocks.append(Card(
-        "Recent history",
-        DataTable(hist_headers, [row(b, False) for b in history], empty_msg="No past bookings yet."),
-        hint="Last 15", flush=True,
-    ))
+    blocks = [Alert(msg, kind)] if msg else []
+    blocks.append(Card("Upcoming bookings",
+                        DataTable(base + ["Actions"], [row(b, True) for b in upcoming],
+                                   empty_msg="No upcoming bookings."),
+                        flush=True))
+    blocks.append(Card("Recent history",
+                        DataTable(base, [row(b, False) for b in history], empty_msg="No past bookings yet."),
+                        hint="Last 15", flush=True))
 
-    return Page(
-        "Bookings", *blocks,
-        subtitle="All reservations across the campus estate.",
-        active="/bookings", role=role,
-        actions=[A("+ New booking", href="/bookings/new", cls="btn btn-primary")],
-    )
+    return Page("Bookings" if staff else "My bookings", *blocks,
+                subtitle="All reservations across the campus estate." if staff
+                else "Your upcoming and past reservations.",
+                active="/bookings", user=user,
+                actions=[A("+ New booking", href="/bookings/new", cls="btn btn-primary")])
 
 
 @rt("/bookings/new")
 def get(session, msg: str = "", kind: str = "error", resource_id: str = ""):
-    role = session.get("role", "student")
-    safe_kind = kind if kind in ("info", "ok", "warn", "error") else "error"
-
-    try:
-        active_resources = list_resources(active_only=True)
-    except Exception as exc:
-        logger.exception("Failed to load active resources for booking form: %s", exc)
-        return Page(
-            "New booking",
-            Alert("Unable to load bookable resources right now.", "error"),
-            active="/bookings", role=role,
-        )
-
-    options = [
-        (r["resource_id"], f'{TYPE_ICON.get(r["resource_type"], "📦")} {r["resource_name"]} ({r["room_code"]})')
-        for r in active_resources
-    ]
-    parsed_rid = _parse_positive_int(resource_id, default="")
+    user = current_user(session)
+    resource_id = str(parse_int(resource_id, default=""))
+    options = [(r["resource_id"], f'{r["icon"]} {r["resource_name"]} ({r["room_code"]})')
+               for r in list_resources(active_only=True)]
     form = Form(
         Div(
-            SelectField("resource_id", options, value=str(parsed_rid) if parsed_rid != "" else ""),
-            Field("user_name", help_text="Your name or username"),
-            Field("booking_date", value=date.today().isoformat()),
-            Field("start_time", value="09:00", help_text=f"Campus open {OPEN_HOUR:02d}:00–{CLOSE_HOUR:02d}:00"),
-            Field("end_time", value="11:00"),
+            SelectField("resource_id", options, value=resource_id, label="Resource"),
+            Field("booking_date", value=date.today().isoformat(), type="date",
+                  min=date.today().isoformat()),
+            Field("start_time", value="09:00", type="time", step=1800,
+                  min=f"{OPEN_HOUR:02d}:00", max=f"{CLOSE_HOUR - 1:02d}:30",
+                  help_text=f"Campus open {OPEN_HOUR:02d}:00–{CLOSE_HOUR:02d}:00"),
+            Field("end_time", value="11:00", type="time", step=1800,
+                  min=f"{OPEN_HOUR:02d}:30", max=f"{CLOSE_HOUR:02d}:00",
+                  data_after="start_time"),
             TextArea_("purpose"),
             cls="form-grid",
         ),
@@ -479,130 +510,96 @@ def get(session, msg: str = "", kind: str = "error", resource_id: str = ""):
         A("Cancel", href="/bookings", cls="btn btn-ghost", style="margin-top:18px;margin-left:8px"),
         method="post", action="/bookings/new",
     )
-    blocks = [Alert(msg, safe_kind)] if msg else []
-    blocks.append(Card("Book an item", form))
-    return Page("New booking", *blocks, active="/bookings", role=role)
+    blocks = [Alert(msg, kind)] if msg else []
+    blocks.append(Card("Book an item", form, hint=f'Booking as {user["first_name"]} {user["last_name"]}'))
+    return Page("New booking", *blocks, active="/bookings", user=user)
 
 
 @rt("/bookings/new")
-def post(session, resource_id: int, user_name: str = "", booking_date: str = "",
-         start_time: str = "", end_time: str = "", purpose: str = ""):
-    parsed_rid = _parse_positive_int(resource_id, default=None)
-    parsed_date = _parse_iso_date(booking_date)
-    parsed_start = _parse_hhmm(start_time)
-    parsed_end = _parse_hhmm(end_time)
+def post(session, resource_id: str = "", booking_date: str = "", start_time: str = "",
+         end_time: str = "", purpose: str = ""):
+    user = current_user(session)
+    start_time, end_time = start_time.strip(), end_time.strip()
+    rid = parse_int(resource_id)
+    resource = get_resource(rid) if rid else None
 
-    err = None
-    if parsed_rid is None:
-        err = "Please select a valid resource."
-    elif not user_name or not user_name.strip():
-        err = "Your name is required."
-    elif len(user_name.strip()) > 100:
-        err = "Name must be 100 characters or fewer."
-    elif parsed_date is None:
-        err = "Please enter a valid booking date (YYYY-MM-DD)."
-    elif parsed_date.isoformat() < date.today().isoformat():
-        err = "Booking date cannot be in the past."
-    elif parsed_start is None or parsed_end is None:
-        err = "Start and end times must be in valid HH:MM format."
-    elif parsed_end <= parsed_start:
-        err = "End time must be after start time."
-    elif not (f"{OPEN_HOUR:02d}:00" <= parsed_start and parsed_end <= f"{CLOSE_HOUR:02d}:00"):
-        err = f"Bookings must fall within campus hours ({OPEN_HOUR:02d}:00–{CLOSE_HOUR:02d}:00)."
-    elif len(purpose.strip()) > 300:
-        err = "Purpose must be 300 characters or fewer."
+    if not resource or not resource["is_active"]:
+        err = "That resource is not available to book."
+    else:
+        err = booking_error(booking_date, start_time, end_time, purpose,
+                            open_hour=OPEN_HOUR, close_hour=CLOSE_HOUR)
+    if not err and has_clash(rid, booking_date, start_time, end_time):
+        err = "That resource is already booked for this time slot."
+
+    if not err and not create_booking(rid, user["user_id"], booking_date.strip(),
+                                      start_time, end_time, purpose.strip()):
+        # The database's own no-overlap rule caught a booking made a moment earlier.
+        err = "That resource has just been booked for this time slot."
 
     if err:
-        return _redirect_msg("/bookings/new", err, "error")
-
-    try:
-        if has_clash(parsed_rid, parsed_date.isoformat(), parsed_start, parsed_end):
-            return _redirect_msg("/bookings/new", "That resource is already booked for this time slot.", "error")
-        create_booking(
-            parsed_rid, user_name.strip(), parsed_date.isoformat(),
-            parsed_start, parsed_end, purpose.strip(),
-        )
-    except Exception as exc:
-        logger.exception("Failed to create booking: %s", exc)
-        return _redirect_msg("/bookings/new", "Could not complete booking due to a storage error.", "error")
-
-    return _redirect_msg("/bookings", "Booking confirmed", "ok")
+        return go(f"/bookings/new?resource_id={rid}" if rid else "/bookings/new", err, "error")
+    return go("/bookings", "Booking confirmed.")
 
 
 @rt("/bookings/{bid}/status")
 def post(bid: int, session, to: str = "cancelled"):
-    guard = staff_only(session, "/bookings")
-    if guard:
-        return guard
-    if bid <= 0:
-        return _redirect_msg("/bookings", "Invalid booking ID.", "error")
+    user = current_user(session)
+    booking = get_booking(bid)
+    if not booking:
+        return go("/bookings", "Booking not found.", "error")
     if to not in STATUSES:
-        return _redirect_msg("/bookings", "Invalid booking status requested.", "error")
-
-    try:
-        set_booking_status(bid, to)
-    except Exception as exc:
-        logger.exception("Failed to update booking %s status to %s: %s", bid, to, exc)
-        return _redirect_msg("/bookings", "Could not update booking status due to a storage error.", "error")
-
-    return _redirect_msg("/bookings", f"Booking marked {to}", "ok")
+        return go("/bookings", "That is not a valid booking status.", "error")
+    if not is_staff(session):
+        # Students may only cancel their own upcoming bookings.
+        if booking["user_id"] != user["user_id"] or to != "cancelled" or booking["status"] != "confirmed":
+            return go("/bookings", "You can only cancel your own upcoming bookings.", "error")
+    set_booking_status(bid, to)
+    return go("/bookings", f'Booking marked {to.replace("_", " ")}.')
 
 
 # ---------------- Availability ----------------
 @rt("/availability")
 def get(session, d: str = "", rtype: str = ""):
-    role = session.get("role", "student")
-    parsed_d = _parse_iso_date(d, fallback=date.today())
-    iso_d = parsed_d.isoformat()
-
-    valid_types = {t[0] if isinstance(t, (tuple, list)) else t for t in TYPES}
-    clean_rtype = rtype if rtype in valid_types else ""
-
+    user = current_user(session)
+    staff = is_staff(session)
+    notices = []
+    day = parse_date(d)
+    if d and day is None:
+        notices.append(Alert("That date was not valid, so today is shown instead.", "warn"))
+    d = (day or date.today()).isoformat()
+    types = type_names()
+    if rtype and rtype not in types:
+        notices.append(Alert("Unknown resource type ignored; showing all types.", "warn"))
+        rtype = ""
     rows = []
-    try:
-        resources = list_resources(active_only=True, rtype=clean_rtype)
-        for r in resources:
-            slots = slots_for(r["resource_id"], iso_d)
-            used = sum(_hours(s["start_time"], s["end_time"]) for s in slots)
-            slot_spans = [Span(f'{s["start_time"]}–{s["end_time"]} {s["user_name"]}', cls="slot") for s in slots]
-            if not slot_spans:
-                slot_spans = [Span(f"Free all day ({OPEN_HOUR:02d}:00–{CLOSE_HOUR:02d}:00)", cls="slot free")]
-            rows.append(Tr(
-                Cell(f'{TYPE_ICON.get(r["resource_type"], "📦")} {r["resource_name"]}', f'{r["building"]} {r["room_code"]}'),
-                Td(*slot_spans),
-                Td(f'{max((CLOSE_HOUR - OPEN_HOUR) - used, 0):g} hrs free'),
-                Td(A("Book", href=f'/bookings/new?resource_id={r["resource_id"]}', cls="btn btn-primary btn-sm")),
-            ))
-    except Exception as exc:
-        logger.exception("Failed to load availability for %s: %s", iso_d, exc)
-        return Page(
-            "Availability",
-            Alert("Unable to load slot availability due to a storage error.", "error"),
-            subtitle="Check free and booked slots by date.",
-            active="/availability", role=role,
-        )
+    for r in list_resources(active_only=True, rtype=rtype):
+        slots = slots_for(r["resource_id"], d)
+        used = sum(_hours(s["start_time"], s["end_time"]) for s in slots)
+        # Privacy: only staff see who made a booking. Students just see the slot is taken.
+        slot_spans = [Span(f'{s["start_time"]}–{s["end_time"]} ' + (s["user_name"] if staff else "Booked"),
+                           cls="slot") for s in slots]
+        if not slot_spans:
+            slot_spans = [Span(f"Free all day ({OPEN_HOUR:02d}:00–{CLOSE_HOUR:02d}:00)", cls="slot free")]
+        rows.append(Tr(
+            Cell(f'{r["icon"]} {r["resource_name"]}', f'{r["building"]} {r["room_code"]}'),
+            Td(*slot_spans),
+            Td(f'{max((CLOSE_HOUR - OPEN_HOUR) - used, 0):g} hrs free'),
+            Td(A("Book", href=f'/bookings/new?resource_id={r["resource_id"]}', cls="btn btn-primary btn-sm")),
+        ))
 
     form = Form(
-        Field("d", value=iso_d),
-        SelectField("rtype", TYPES, value=clean_rtype, blank="All types"),
+        Field("d", value=d, type="date", label="Date"),
+        SelectField("rtype", types, value=rtype, blank="All types", label="Resource type"),
         Button("Search", cls="btn btn-primary", style="align-self:flex-end"),
         cls="filters", method="get", action="/availability",
     )
-    pretty = _format_display_date(iso_d, "%A %d %B %Y")
-    notices = []
-    if d and _parse_iso_date(d) is None:
-        notices.append(Alert(f"Invalid date '{d}'; showing today ({pretty}).", "warn"))
-
+    pretty = _pretty_date(d, "%A %d %B %Y")
     return Page(
-        "Availability", *notices,
-        Card("Filters", form),
-        Card(
-            f"Resources on {pretty}",
-            DataTable(["Resource", "Booked slots", "Free hours", ""], rows,
-                      empty_msg="No active resources match that filter."),
-        ),
+        "Availability", *notices, Card("Filters", form),
+        Card(f"Resources on {pretty}", DataTable(["Resource", "Booked slots", "Free hours", ""], rows,
+                                                    empty_msg="No active resources match that filter.")),
         subtitle="Check free and booked slots by date.",
-        active="/availability", role=role,
+        active="/availability", user=user,
     )
 
 
@@ -612,64 +609,34 @@ def get(session):
     guard = staff_only(session, "/")
     if guard:
         return guard
-
-    try:
-        k = kpis()
-        bld_data = by_building()
-        type_data = bookings_by_type()
-        trend_data = weekly_trend(8)
-    except Exception as exc:
-        logger.exception("Failed to generate staff reports: %s", exc)
-        return Page(
-            "Reports",
-            Alert("Unable to generate reports due to a data/storage error.", "error"),
-            subtitle="Service-level analytics for the last 30 days.",
-            active="/reports", role="staff",
-        )
-
+    k = kpis()
     bld_rows = [
-        Tr(
-            Td(b["building"]),
-            Td(b["n"]),
-            Td(b["cancelled"]),
-            Td(f'{round((b["cancelled"] / b["n"]) * 100) if b["n"] else 0}%'),
-        )
-        for b in bld_data
+        Tr(Td(b["label"]), Td(b["value"]), Td(b["cancelled"]),
+           Td(f'{round((b["cancelled"] / b["value"]) * 100) if b["value"] else 0}%'))
+        for b in by_building()
     ]
     return Page(
         "Reports",
-        Card(
-            "Service-level KPIs",
-            StatsRow(
-                StatItem("📅", k["total_bookings"], label="Total bookings",
-                         note=f'{k["period_from"]} – {k["period_to"]}'),
-                StatItem("⏱️", k["booked_hours"], label="Booked hours"),
-                StatItem("📈", k["utilisation_rate"], unit="%", label="Utilisation"),
-                StatItem("❓", k["no_show_rate"], unit="%", label="No-show rate",
-                         note=f'{k["no_show_bookings"]} not attended'),
-            ),
-            hint="Last 30 days",
-        ),
-        Card("Bookings by resource type", BarChart(type_data)),
-        Card("Weekly trend", LineChart(trend_data), hint="Last 8 weeks"),
-        Card(
-            "By building",
-            DataTable(["Building", "Bookings", "Cancelled", "Cancel %"], bld_rows,
-                      empty_msg="No data yet."),
-            flush=True,
-        ),
+        Card("Service-level KPIs",
+             StatsRow(
+                 StatItem("📅", k["total_bookings"], label="Total bookings",
+                           note=f'{k["period_from"]} – {k["period_to"]}'),
+                 StatItem("⏱️", k["booked_hours"], label="Booked hours"),
+                 StatItem("📈", k["utilisation_rate"], unit="%", label="Utilisation"),
+                 StatItem("❓", k["no_show_rate"], unit="%", label="No-show rate",
+                           note=f'{k["no_show_bookings"]} not attended'),
+             ), hint="Last 30 days"),
+        Card("Bookings by resource type", BarChart(bookings_by_type())),
+        Card("Weekly trend", LineChart(weekly_trend(8)), hint="Last 8 weeks"),
+        Card("By building", DataTable(["Building", "Bookings", "Cancelled", "Cancel %"], bld_rows,
+                                        empty_msg="No data yet."), flush=True),
         subtitle="Service-level analytics for the last 30 days.",
-        active="/reports", role="staff",
+        active="/reports", user=current_user(session),
     )
 
 
 # ---------------- Entry point ----------------
 if __name__ == "__main__":
-    raw_port = os.environ.get("PORT", "8080")
-    port = _parse_positive_int(raw_port, default=8080, min_val=1, max_val=65535)
+    port = parse_int(os.environ.get("PORT") or os.environ.get("APP_PORT"), default=8080, max_val=65535)
     is_cloud = "PORT" in os.environ
-    try:
-        serve(host="0.0.0.0", port=port, reload=not is_cloud)
-    except Exception as exc:
-        logger.exception("Application server failed to start on port %s: %s", port, exc)
-        raise
+    serve(host="0.0.0.0", port=port, reload=not is_cloud)
