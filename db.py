@@ -31,6 +31,8 @@ OPEN_HOUR, CLOSE_HOUR = 8, 20
 # pay the cost of a fresh network handshake with Supabase.
 _pool = None
 _pool_lock = threading.Lock()
+_POOL_MAX = 5
+_MAX_ATTEMPTS = _POOL_MAX + 1
 
 
 def _get_pool():
@@ -42,7 +44,7 @@ def _get_pool():
                 raise RuntimeError("DATABASE_URL is not set. Copy .env.example to .env and fill it in.")
             try:
                 _pool = ThreadedConnectionPool(
-                    1, 5, dsn=url, cursor_factory=RealDictCursor, connect_timeout=15,
+                    1, _POOL_MAX, dsn=url, cursor_factory=RealDictCursor, connect_timeout=15,
                     keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3,
                 )
             except psycopg2.Error:
@@ -59,10 +61,12 @@ def _run(sql, params=None, fetch=None):
            None  -> number of rows affected.
     Rows are dictionaries keyed by column name.
     If Supabase has closed an idle connection we throw it away and
-    retry once on a fresh one.
+    try again on another one. Every connection in the pool may have
+    gone stale after a long idle spell, so we allow one try per
+    pooled connection plus one for a brand new connection.
     """
     pool = _get_pool()
-    for attempt in (1, 2):
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
         con = pool.getconn()
         try:
             with con:                       # commits, or rolls back on error
@@ -73,11 +77,18 @@ def _run(sql, params=None, fetch=None):
                     if fetch == "one":
                         return cur.fetchone()
                     return cur.rowcount
-        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+        except psycopg2.Error as exc:
+            # A dropped connection does not always arrive as OperationalError
+            # (it can be a plain DatabaseError), so also check con.closed.
+            dropped = con.closed or isinstance(
+                exc, (psycopg2.OperationalError, psycopg2.InterfaceError))
+            if not dropped:
+                raise                       # a real SQL error: rule broken, bad value...
             pool.putconn(con, close=True)
             con = None
-            if attempt == 2:
+            if attempt == _MAX_ATTEMPTS:
                 raise
+            logger.warning("Database connection was closed; reconnecting.")
         finally:
             if con is not None:
                 pool.putconn(con)
